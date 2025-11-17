@@ -1,182 +1,155 @@
-#include <iostream>
-#include <string>
-#include <unordered_map>
-#include <cstring>
-#include <cstdlib>
+#include "Server.hpp"
+#include "Protocol.hpp"
 
-#include <sys/types.h>
-#include <sys/socket.h>
+#include <iostream>
 #include <unistd.h>
+#include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <errno.h>
 
-#define SERVER_PORT 10000
+Server::Server(int port) {
+    init_socket(port);
+}
 
-int main() {
-    int server_socket;
-    int client_socket;
-    int fd;
-    int return_value;
-    struct sockaddr_in my_addr{}, peer_addr{};
-    socklen_t len_addr;
+Server::~Server() {
+    // Close all client sockets
+    for (auto& [fd, _] : client_buffers) {
+        close(fd);
+    }
+    // Close listening socket
+    close(server_fd);
+}
 
-    fd_set client_socks, tests;
-    int max_fd;
-
-    // Create listening socket
-    server_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_socket < 0) {
+void Server::init_socket(int port) {
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
         perror("socket");
-        return EXIT_FAILURE;
+        std::exit(1);
     }
 
-    // Optional: reuse address (avoids TIME_WAIT issues)
     int opt = 1;
-    if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         perror("setsockopt");
-        close(server_socket);
-        return EXIT_FAILURE;
+        std::exit(1);
     }
 
-    my_addr.sin_family = AF_INET;
-    my_addr.sin_port = htons(SERVER_PORT);
-    my_addr.sin_addr.s_addr = INADDR_ANY;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = INADDR_ANY;
 
-    // Bind to port
-    return_value = bind(server_socket, reinterpret_cast<sockaddr*>(&my_addr),
-                        sizeof(my_addr));
-    if (return_value == 0) {
-        std::cout << "Bind - OK\n";
-    } else {
+    if (bind(server_fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("bind");
-        close(server_socket);
-        return EXIT_FAILURE;
+        std::exit(1);
     }
 
-    // Start listening
-    return_value = listen(server_socket, 5);
-    if (return_value == 0) {
-        std::cout << "Listen - OK\n";
-    } else {
+    if (listen(server_fd, 5) < 0) {
         perror("listen");
-        close(server_socket);
-        return EXIT_FAILURE;
+        std::exit(1);
     }
 
-    // Master set of file descriptors, add listening socket
-    FD_ZERO(&client_socks);
-    FD_SET(server_socket, &client_socks);
-    max_fd = server_socket;
+    FD_ZERO(&master_set);
+    FD_SET(server_fd, &master_set);
+    max_fd = server_fd;
 
-    std::cout << "Server running on port " << SERVER_PORT << "\n";
+    std::cout << "Server listening on port " << port << "\n";
+}
 
-    // Per-client string buffers (fd -> std::string)
-    std::unordered_map<int, std::string> client_buffers;
+void Server::accept_client() {
+    sockaddr_in addr{};
+    socklen_t len = sizeof(addr);
 
+    int client_fd = accept(server_fd, (sockaddr*)&addr, &len);
+    if (client_fd < 0) {
+        perror("accept");
+        return;
+    }
+
+    FD_SET(client_fd, &master_set);
+    if (client_fd > max_fd) {
+        max_fd = client_fd;
+    }
+
+    client_buffers[client_fd] = std::string{};
+
+    char ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
+    std::cout << "New client: " << ip << ":" << ntohs(addr.sin_port)
+              << " fd=" << client_fd << "\n";
+}
+
+void Server::remove_client(int fd) {
+    std::cout << "Client disconnected fd=" << fd << "\n";
+    close(fd);
+    FD_CLR(fd, &master_set);
+    client_buffers.erase(fd);
+
+    if (fd == max_fd) {
+        while (max_fd >= 0 && !FD_ISSET(max_fd, &master_set)) {
+            --max_fd;
+        }
+    }
+}
+
+void Server::handle_client_data(int fd) {
+    char buf[1024];
+    ssize_t n = recv(fd, buf, sizeof(buf), 0);
+
+    if (n <= 0) {
+        // error or client closed connection
+        if (n < 0) {
+            perror("recv");
+        }
+        remove_client(fd);
+        return;
+    }
+
+    std::string& buffer = client_buffers[fd];
+    buffer.append(buf, static_cast<std::size_t>(n));
+
+    // Process complete lines terminated by '\n'
     for (;;) {
-        tests = client_socks;
+        std::size_t pos = buffer.find('\n');
+        if (pos == std::string::npos) {
+            break;
+        }
 
-        // Wait for activity on any socket 0..max_fd
-        return_value = select(max_fd + 1, &tests, nullptr, nullptr, nullptr);
-        if (return_value < 0) {
+        std::string line = buffer.substr(0, pos);
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+
+        buffer.erase(0, pos + 1);
+
+        Request req = parse_request_line(line);
+        handle_request(fd, req);
+    }
+}
+
+void Server::run() {
+    while (true) {
+        fd_set read_set = master_set;
+
+        int rv = select(max_fd + 1, &read_set, nullptr, nullptr, nullptr);
+        if (rv < 0) {
+            if (errno == EINTR) {
+                continue; // interrupted by signal, retry
+            }
             perror("select");
             break;
         }
 
-        // Check all file descriptors
-        for (fd = 0; fd <= max_fd; ++fd) {
-            if (!FD_ISSET(fd, &tests))
+        for (int fd = 0; fd <= max_fd; ++fd) {
+            if (!FD_ISSET(fd, &read_set)) {
                 continue;
-
-            // New incoming connection on listening socket
-            if (fd == server_socket) {
-                len_addr = sizeof(peer_addr);
-                client_socket = accept(server_socket,
-                                       reinterpret_cast<sockaddr*>(&peer_addr),
-                                       &len_addr);
-                if (client_socket < 0) {
-                    perror("accept");
-                    continue;
-                }
-
-                FD_SET(client_socket, &client_socks);
-                if (client_socket > max_fd)
-                    max_fd = client_socket;
-
-                // Create empty buffer for this client
-                client_buffers[client_socket] = std::string{};
-
-                char ip[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &peer_addr.sin_addr, ip, sizeof(ip));
-                std::cout << "New client connected " << ip
-                          << ":" << ntohs(peer_addr.sin_port)
-                          << " (fd=" << client_socket << ")\n";
             }
-            // Existing client socket – read data
-            else {
-                char buf[1024];
-                ssize_t n = recv(fd, buf, sizeof(buf), 0);
 
-                if (n > 0) {
-                    // Append received bytes to this client's string buffer
-                    std::string& buffer = client_buffers[fd];
-                    buffer.append(buf, n);
-
-                    // Process complete lines (terminated by '\n')
-                    for (;;) {
-                        std::size_t pos = buffer.find('\n');
-                        if (pos == std::string::npos)
-                            break;
-
-                        // Extract one line (without '\n')
-                        std::string line = buffer.substr(0, pos);
-                        // Trim possible '\r'
-                        if (!line.empty() && line.back() == '\r') {
-                            line.pop_back();
-                        }
-
-                        // Remove processed part from buffer
-                        buffer.erase(0, pos + 1);
-
-                        // Here you process the line (protocol logic)
-                        std::cout << "Received line from fd=" << fd
-                                  << ": \"" << line << "\"\n";
-
-                        // Example: echo back (optional)
-                        std::string response = "ECHO: " + line + "\n";
-                        ssize_t sent = send(fd, response.data(), response.size(), 0);
-                        if (sent < 0) {
-                            perror("send");
-                        }
-                    }
-                }
-                else if (n == 0) {
-                    // Client closed the connection
-                    std::cout << "Client fd=" << fd
-                              << " disconnected, removing from set\n";
-                    close(fd);
-                    FD_CLR(fd, &client_socks);
-                    client_buffers.erase(fd);
-                }
-                else {
-                    // recv() error
-                    perror("recv");
-                    std::cout << "Error on fd=" << fd
-                              << ", closing and removing from set\n";
-                    close(fd);
-                    FD_CLR(fd, &client_socks);
-                    client_buffers.erase(fd);
-                }
+            if (fd == server_fd) {
+                accept_client();
+            } else {
+                handle_client_data(fd);
             }
         }
     }
-
-    // Cleanup if select() fails / server exits
-    for (fd = 0; fd <= max_fd; ++fd) {
-        if (FD_ISSET(fd, &client_socks)) {
-            close(fd);
-        }
-    }
-
-    return EXIT_FAILURE;
 }
