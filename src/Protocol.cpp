@@ -1,276 +1,190 @@
 #include "Protocol.hpp"
+#include <sstream>
 
-#include <iostream>
-#include <sys/socket.h>
-#include <unistd.h>
-
-// Protocol magic prefix required on all incoming and outgoing messages.
-static constexpr const char* PROTOCOL_MAGIC = "MRLLN";
-
-
-// ============================================================================
-//  Helper: split
-// ============================================================================
-
-/**
- * @brief Splits a string into segments separated by a delimiter.
- *
- * @param s The input string to split.
- * @param delim The delimiter character.
- * @return std::vector<std::string> A list of substrings.
- *
- * @note Empty segments are preserved:
- *       split("A||B", '|') → ["A", "", "B"]
- */
-std::vector<std::string> split(const std::string& s, char delim) {
+static std::vector<std::string> split(const std::string& s, char delim) {
     std::vector<std::string> parts;
-    std::string current;
-
-    for (char ch : s) {
-        if (ch == delim) {
-            parts.push_back(current);
-            current.clear();
-        } else {
-            current.push_back(ch);
-        }
+    std::stringstream ss(s);
+    std::string item;
+    while (std::getline(ss, item, delim)) {
+        parts.push_back(item);
     }
-    parts.push_back(current);
     return parts;
 }
 
-
-// ============================================================================
-//  Mapping REQ_* strings to RequestType enum
-// ============================================================================
-
-/**
- * @brief Converts a textual REQ_* descriptor into a RequestType enum.
- *
- * @param s The request type string, e.g. "REQ_LOGIN".
- * @return RequestType Matching type, or RequestType::Unknown if not recognized.
- */
-RequestType request_type_from_string(const std::string& s) {
-    if (s == "REQ_LOGIN")         return RequestType::Login;
-    if (s == "REQ_LOGOUT")        return RequestType::Logout;
-    if (s == "REQ_CREATE_LOBBY")  return RequestType::CreateLobby;
-    if (s == "REQ_JOIN_LOBBY")    return RequestType::JoinLobby;
-    if (s == "REQ_LEAVE_LOBBY")   return RequestType::LeaveLobby;
-    if (s == "REQ_MOVE")          return RequestType::Move;
-    if (s == "REQ_REMATCH")       return RequestType::Rematch;
-    if (s == "REQ_PING")          return RequestType::Ping;
-
-    return RequestType::Unknown;
+static void trim_trailing_empty_token(std::vector<std::string>& parts) {
+    // Client uses trailing '|' => split() produces last token = ""
+    if (!parts.empty() && parts.back().empty()) {
+        parts.pop_back();
+    }
 }
 
-
-// ============================================================================
-//  Parsing incoming MRLLN|REQ_... messages
-// ============================================================================
-
-/**
- * @brief Parses a raw protocol line into a structured Request.
- *
- * Expected input format:
- *    MRLLN|REQ_TYPE|param1|param2|...
- *
- * @param line A complete line received from the client (without trailing '\n').
- * @return Request Parsed request. If invalid or missing magic,
- *         returns Request with RequestType::Unknown.
- *
- * @note This function is STRICT: magic (MRLLN) is required.
- * @note Only REQ_* messages are accepted from clients.
- */
+//
+// ---- Parsing ----
+//
 Request parse_request_line(const std::string& line) {
     Request req;
-
     auto parts = split(line, '|');
+    trim_trailing_empty_token(parts);
+
     if (parts.size() < 2) {
-        return req; // Unknown
+        req.valid_magic = false;
+        return req;
     }
 
-    // Magic prefix required
+    // Magic check
     if (parts[0] != PROTOCOL_MAGIC) {
+        req.valid_magic = false;
         return req;
     }
 
-    const std::string& type_desc = parts[1];
+    const std::string& tag = parts[1];
 
-    // Must start with REQ_
-    if (type_desc.rfind("REQ_", 0) != 0) {
-        return req;
-    }
+    if (tag == "REQ_LOGIN") req.type = RequestType::LOGIN;
+    else if (tag == "REQ_LOGOUT") req.type = RequestType::LOGOUT;
+    else if (tag == "REQ_CREATE_LOBBY") req.type = RequestType::CREATE_LOBBY;
+    else if (tag == "REQ_JOIN_LOBBY") req.type = RequestType::JOIN_LOBBY;
+    else if (tag == "REQ_LEAVE_LOBBY") req.type = RequestType::LEAVE_LOBBY;
+    else if (tag == "REQ_MOVE") req.type = RequestType::MOVE;
+    else if (tag == "REQ_REMATCH") req.type = RequestType::REMATCH;
+    else if (tag == "REQ_STATE") req.type = RequestType::STATE;
+    else if (tag == "REQ_PING") req.type = RequestType::PING;
+    else req.type = RequestType::INVALID;
 
-    req.type = request_type_from_string(type_desc);
-
-    // Remaining segments are parameters
-    for (std::size_t i = 2; i < parts.size(); ++i) {
-        req.params.push_back(parts[i]);
+    for (size_t i = 2; i < parts.size(); ++i) {
+        if (!parts[i].empty()) { // be defensive
+            req.params.push_back(parts[i]);
+        }
     }
 
     return req;
 }
 
-
-// ============================================================================
-//  Sending messages to client (always with MRLLN prefix)
-// ============================================================================
-
-/**
- * @brief Sends a protocol message to the client with magic prefix.
- *
- * Builds and sends:
- *    MRLLN|<body>\n
- *
- * @param fd Socket file descriptor.
- * @param body The message body, e.g. "RES_LOGIN_OK|123".
- *
- * @note This function logs errors using perror().
- */
-static void send_with_magic(int fd, const std::string& body) {
-    std::string msg;
-    msg.reserve(6 + body.size() + 1);
-
-    msg.append(PROTOCOL_MAGIC);
-    msg.push_back('|');
-    msg.append(body);
-    msg.push_back('\n');
-
-    ssize_t n = ::send(fd, msg.data(), msg.size(), 0);
-    if (n < 0) {
-        perror("send");
-    }
+//
+// ---- Response prefix helper ----
+// Always emits trailing '|' so wire is consistent with your Python client.
+//
+static std::string prefix(const std::string& body_without_trailing_pipe) {
+    return std::string(PROTOCOL_MAGIC) + "|" + body_without_trailing_pipe + "|";
 }
 
+//
+// ---- OK responses ----
+//
 
-// ============================================================================
-//  Core request handler
-// ============================================================================
+std::string Responses::login_ok(int userId) {
+    return prefix("RES_LOGIN_OK|" + std::to_string(userId));
+}
 
-/**
- * @brief Processes one parsed Request and sends an appropriate protocol response.
- *
- * @param fd Socket file descriptor of the client.
- * @param req The parsed Request object.
- *
- * This function handles:
- *   - REQ_LOGIN
- *   - REQ_LOGOUT
- *   - REQ_CREATE_LOBBY
- *   - REQ_JOIN_LOBBY
- *   - REQ_LEAVE_LOBBY
- *   - REQ_MOVE
- *   - REQ_REMATCH
- *   - REQ_PING
- *
- * @note Full lobby/game logic will be implemented in the next stage.
- * @note Unknown requests trigger EVT_ERROR.
- */
-void handle_request(int fd, const Request& req) {
-    switch (req.type) {
+std::string Responses::login_fail() {
+    return prefix("RES_LOGIN_FAIL");
+}
 
-        case RequestType::Login: {
-            if (req.params.size() < 1) {
-                send_with_magic(fd, "EVT_ERROR|400|Missing username");
-                return;
-            }
+std::string Responses::logout_ok() {
+    return prefix("RES_LOGOUT_OK");
+}
 
-            const std::string& username = req.params[0];
+std::string Responses::lobby_created(int lobbyId) {
+    return prefix("RES_LOBBY_CREATED|" + std::to_string(lobbyId));
+}
 
-            // TODO: Implement real user authentication
-            int fakeUserId = 1;
+std::string Responses::lobby_joined(const std::string& lobbyName) {
+    return prefix("RES_LOBBY_JOINED|" + lobbyName);
+}
 
-            std::cout << "Login request from fd=" << fd
-                      << " username=" << username << "\n";
+std::string Responses::lobby_left() {
+    return prefix("RES_LOBBY_LEFT");
+}
 
-            send_with_magic(fd, "RES_LOGIN_OK|" + std::to_string(fakeUserId));
-            break;
-        }
+std::string Responses::move_accepted(const std::string& moveStr) {
+    return prefix("RES_MOVE|" + moveStr);
+}
 
-        case RequestType::Logout: {
-            send_with_magic(fd, "RES_LOGOUT_OK");
-            break;
-        }
+std::string Responses::game_started() {
+    return prefix("RES_GAME_STARTED");
+}
 
-        case RequestType::CreateLobby: {
-            if (req.params.size() < 1) {
-                send_with_magic(fd, "EVT_ERROR|400|Missing lobby_name");
-                return;
-            }
+std::string Responses::round_result(int winnerUserId,
+                                    const std::string& p1Move,
+                                    const std::string& p2Move)
+{
+    return prefix(
+        "RES_ROUND_RESULT|" +
+        std::to_string(winnerUserId) + "|" + p1Move + "|" + p2Move
+    );
+}
 
-            const std::string& lobby_name = req.params[0];
+std::string Responses::match_result(int winnerUserId,
+                                    int p1Wins,
+                                    int p2Wins)
+{
+    return prefix(
+        "RES_MATCH_RESULT|" +
+        std::to_string(winnerUserId) + "|" +
+        std::to_string(p1Wins) + "|" +
+        std::to_string(p2Wins)
+    );
+}
 
-            std::cout << "Create lobby request from fd=" << fd
-                      << " lobby_name=" << lobby_name << "\n";
+std::string Responses::rematch_ready() {
+    return prefix("RES_REMATCH_READY");
+}
 
-            // TODO: Implement lobby creation
-            int fakeLobbyId = 1;
+std::string Responses::game_cannot_continue(const std::string& reason) {
+    return prefix("RES_GAME_CANNOT_CONTINUE|" + reason);
+}
 
-            send_with_magic(fd, "RES_LOBBY_CREATED|" + std::to_string(fakeLobbyId));
-            break;
-        }
+std::string Responses::state(const std::string& debug) {
+    return prefix("RES_STATE|" + debug);
+}
 
-        case RequestType::JoinLobby: {
-            if (req.params.size() < 2) {
-                send_with_magic(fd, "EVT_ERROR|400|Missing username or lobby_name");
-                return;
-            }
+std::string Responses::pong() {
+    return prefix("RES_PONG");
+}
 
-            const std::string& username   = req.params[0];
-            const std::string& lobby_name = req.params[1];
+//
+// ---- ERROR RESPONSES ----
+//
 
-            std::cout << "Join lobby request from fd=" << fd
-                      << " user=" << username
-                      << " lobby=" << lobby_name << "\n";
+std::string Responses::error_unexpected_state() {
+    return prefix("RES_ERROR|Unexpected request in current session state");
+}
 
-            // TODO: Implement real membership logic
-            std::string fakeMembers = username;
+std::string Responses::error_invalid_magic() {
+    return prefix("RES_ERROR|Invalid protocol magic");
+}
 
-            send_with_magic(fd,
-                "RES_LOBBY_JOINED|" + lobby_name + "|" + fakeMembers);
-            break;
-        }
+std::string Responses::error_invalid_move() {
+    return prefix("RES_ERROR|Invalid or unknown move");
+}
 
-        case RequestType::LeaveLobby: {
-            send_with_magic(fd, "RES_LOBBY_LEFT");
-            break;
-        }
+std::string Responses::error_not_in_lobby() {
+    return prefix("RES_ERROR|Player not in lobby");
+}
 
-        case RequestType::Move: {
-            if (req.params.size() < 1) {
-                send_with_magic(fd, "EVT_ERROR|400|Missing move");
-                return;
-            }
+std::string Responses::error_lobby_full() {
+    return prefix("RES_ERROR|Lobby already has 2 players");
+}
 
-            const std::string& move = req.params[0];
+std::string Responses::error_lobby_not_found() {
+    return prefix("RES_ERROR|Lobby not found");
+}
 
-            std::cout << "Move request from fd=" << fd
-                      << " move=" << move << "\n";
+std::string Responses::error_unknown_request() {
+    return prefix("RES_ERROR|Unknown or malformed request");
+}
 
-            // TODO: Implement round/game evaluation
-            send_with_magic(fd, "RES_MOVE_ACCEPTED");
-            break;
-        }
+std::string Responses::error_not_in_game() {
+    return prefix("RES_ERROR|Player not currently in a game");
+}
 
-        case RequestType::Rematch: {
-            std::cout << "Rematch request from fd=" << fd << "\n";
+std::string Responses::error_rematch_not_allowed() {
+    return prefix("RES_ERROR|Rematch only allowed after match completion");
+}
 
-            // TODO: Implement real rematch logic
-            int fakeMatchId = 1;
+std::string Responses::error_malformed_request() {
+    return prefix("RES_ERROR|Malformed request syntax");
+}
 
-            send_with_magic(fd,
-                "RES_REMATCH_ACCEPTED|" + std::to_string(fakeMatchId));
-            break;
-        }
-
-        case RequestType::Ping: {
-            send_with_magic(fd, "RES_PONG");
-            break;
-        }
-
-        case RequestType::Unknown:
-        default: {
-            send_with_magic(fd, "EVT_ERROR|400|Unknown request");
-            break;
-        }
-    }
+std::string Responses::error(const std::string& msg) {
+    return prefix("RES_ERROR|" + msg);
 }

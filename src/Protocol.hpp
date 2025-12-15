@@ -1,31 +1,76 @@
 #pragma once
+
 #include <string>
 #include <vector>
 
-// ---------- Request Types ----------
+inline constexpr const char* PROTOCOL_MAGIC = "MRLLN";
 
 enum class RequestType {
-    Login,
-    Logout,
-    CreateLobby,
-    JoinLobby,
-    LeaveLobby,
-    Move,
-    Rematch,
-    Ping,
-    Unknown
+    LOGIN,
+    LOGOUT,
+    CREATE_LOBBY,
+    JOIN_LOBBY,     // params: lobbyName
+    LEAVE_LOBBY,
+    MOVE,           // params: R/P/S
+    REMATCH,
+    STATE,
+    PING,
+    INVALID
 };
 
 struct Request {
-    RequestType type = RequestType::Unknown;
+    RequestType type{RequestType::INVALID};
     std::vector<std::string> params;
+    bool valid_magic{true};   // false = bad/missing magic => close connection
 };
-
-// ---------- Functions ----------
-std::vector<std::string> split(const std::string& s, char delim);
-
-RequestType request_type_from_string(const std::string& s);
 
 Request parse_request_line(const std::string& line);
 
-void handle_request(int fd, const Request& req);
+namespace Responses {
+
+    // ---- OK responses ----
+    std::string login_ok(int userId);
+    std::string login_fail();
+
+    std::string logout_ok();
+
+    std::string lobby_created(int lobbyId);
+    std::string lobby_joined(const std::string& lobbyName);
+    std::string lobby_left();
+
+    std::string game_started();
+
+    std::string move_accepted(const std::string& moveStr);
+
+    // winnerUserId: 0 = draw, otherwise internal playerId
+    std::string round_result(int winnerUserId,
+                             const std::string& p1Move,
+                             const std::string& p2Move);
+
+    // winnerUserId: 0 = draw, otherwise internal playerId
+    std::string match_result(int winnerUserId,
+                             int p1Wins,
+                             int p2Wins);
+
+    std::string rematch_ready();
+
+    std::string game_cannot_continue(const std::string& reason);
+
+    std::string state(const std::string& debug);
+
+    std::string pong();
+
+    // ---- Error responses ----
+    std::string error_unexpected_state();
+    std::string error_invalid_magic();
+    std::string error_invalid_move();
+    std::string error_not_in_lobby();
+    std::string error_lobby_full();
+    std::string error_lobby_not_found();
+    std::string error_unknown_request();
+    std::string error_not_in_game();
+    std::string error_rematch_not_allowed();
+    std::string error_malformed_request();
+    std::string error(const std::string& msg);
+
+}
