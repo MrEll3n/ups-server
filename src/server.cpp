@@ -645,12 +645,19 @@ void Server::send_line(int fd, const std::string& line) {
 
 void Server::run() {
     while (true) {
+        // 1. Heartbeat tick (odesílání pingů)
         if (heartbeat_enabled) {
             heartbeat_tick();
         }
 
+        // 2. KONTROLA ODPOJENÝCH HRÁČŮ - TOTO JE KLÍČOVÉ PRO UKONČENÍ HRY PO 15s
+        // Bez tohoto volání server nikdy neví, že čas vypršel.
+        check_disconnection_timeouts();
+
         fd_set read_fds = master_set;
         timeval tv{};
+        // Důležité: Timeout selectu musí být krátký (např. 500ms),
+        // aby se smyčka točila a check_disconnection_timeouts se volalo často.
         tv.tv_sec = 0;
         tv.tv_usec = 500000; // 500 ms
 
