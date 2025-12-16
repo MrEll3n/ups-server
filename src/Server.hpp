@@ -1,7 +1,7 @@
 #pragma once
 
 #include "Game.hpp"
-#include "Protocol.hpp" // Zde je definován SessionPhase
+#include "Protocol.hpp"
 
 #include <unordered_map>
 #include <string>
@@ -9,12 +9,10 @@
 #include <chrono>
 #include <random>
 
-// ZDE BYLA DEFINICE SessionPhase - MUSÍ BÝT SMAZÁNA,
-// PROTOŽE SE NAČÍTÁ Z Protocol.hpp
-
 class Server {
 public:
-    explicit Server(int port, bool enable_heartbeat = true, bool hb_logs = false);
+    // PŘIDÁNO: host argument
+    explicit Server(const std::string& host, int port, bool enable_heartbeat = true, bool hb_logs = false);
     void run();
 
 private:
@@ -24,9 +22,7 @@ private:
 
     Game game;
 
-    std::unordered_map<int, std::string> client_buffers; // fd -> buffered data
-
-    // Map from socket fd to internal player id used by Game
+    std::unordered_map<int, std::string> client_buffers;
     std::unordered_map<int, int> fd_to_player;
 
     std::mt19937 rng{std::random_device{}()};
@@ -35,7 +31,6 @@ private:
     bool heartbeat_enabled{true};
     bool heartbeat_logs{false};
 
-    // --- Heartbeat (server->client ping, client->server pong) ---
     struct Heartbeat {
         std::chrono::steady_clock::time_point last_pong{std::chrono::steady_clock::now()};
         std::chrono::steady_clock::time_point last_ping{std::chrono::steady_clock::now()};
@@ -43,10 +38,11 @@ private:
     };
 
     std::unordered_map<int, Heartbeat> heartbeats;
-
     std::unordered_map<int, std::chrono::steady_clock::time_point> disconnected_players;
 
-    void init_socket(int port);
+    // UPRAVENO: init_socket bere host a port
+    void init_socket(const std::string& host, int port);
+
     void accept_client();
     void remove_client(int fd);
 
@@ -63,9 +59,6 @@ private:
     void check_disconnection_timeouts();
 
     int find_disconnected_player_by_name(const std::string& name);
-
-    // Unified cleanup path for unexpected disconnects / timeouts
     void disconnect_fd(int fd, const std::string& reason);
-
     void heartbeat_tick();
 };

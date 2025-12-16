@@ -2,24 +2,60 @@
 
 #include <iostream>
 #include <cstring>
+#include <string>
+
+void print_usage(const char* prog_name) {
+    std::cerr << "Usage: " << prog_name << " [options]\n"
+              << "Options:\n"
+              << "  --ip <address>       IP address to bind (default: 0.0.0.0)\n"
+              << "  --port <number>      Port to listen on (default: 10000)\n"
+              << "  --no-heartbeat       Disable heartbeat mechanism\n"
+              << "  --with-hb-logs       Enable verbose heartbeat logs\n";
+}
 
 int main(int argc, char** argv) {
+    std::string ip_address = "0.0.0.0";
     int port = 10000;
     bool enable_heartbeat = true;
     bool heartbeat_logs = false;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--no-heartbeat") == 0) {
+        std::string arg = argv[i];
+
+        if (arg == "--ip") {
+            if (i + 1 < argc) {
+                ip_address = argv[++i];
+            } else {
+                std::cerr << "[ERR] Missing value for --ip\n";
+                return 1;
+            }
+        } else if (arg == "--port") {
+            if (i + 1 < argc) {
+                port = std::stoi(argv[++i]);
+            } else {
+                std::cerr << "[ERR] Missing value for --port\n";
+                return 1;
+            }
+        } else if (arg == "--no-heartbeat") {
             enable_heartbeat = false;
-        } else if (strcmp(argv[i], "--with-hb-logs") == 0) {
+        } else if (arg == "--with-hb-logs") {
             heartbeat_logs = true;
+        } else if (arg == "--help" || arg == "-h") {
+            print_usage(argv[0]);
+            return 0;
         } else {
-            port = std::stoi(argv[i]);
+            try {
+                port = std::stoi(arg);
+            } catch (...) {
+                std::cerr << "[ERR] Unknown argument: " << arg << "\n";
+                print_usage(argv[0]);
+                return 1;
+            }
         }
     }
 
     try {
-        Server server(port, enable_heartbeat, heartbeat_logs);
+        Server server(ip_address, port, enable_heartbeat, heartbeat_logs);
         server.run();
     } catch (const std::exception& e) {
         std::cerr << "[ERR] " << e.what() << "\n";
