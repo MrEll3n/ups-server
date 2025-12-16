@@ -1,43 +1,42 @@
 #include "Protocol.hpp"
+
 #include <sstream>
 
 static std::vector<std::string> split(const std::string& s, char delim) {
     std::vector<std::string> parts;
-    std::stringstream ss(s);
-    std::string item;
-    while (std::getline(ss, item, delim)) {
-        parts.push_back(item);
+    std::string cur;
+    std::istringstream iss(s);
+    while (std::getline(iss, cur, delim)) {
+        parts.push_back(cur);
     }
     return parts;
 }
 
-static void trim_trailing_empty_token(std::vector<std::string>& parts) {
-    // Client uses trailing '|' => split() produces last token = ""
-    if (!parts.empty() && parts.back().empty()) {
+static void trim_trailing_empty(std::vector<std::string>& parts) {
+    while (!parts.empty() && parts.back().empty()) {
         parts.pop_back();
     }
 }
 
-//
-// ---- Parsing ----
-//
 Request parse_request_line(const std::string& line) {
     Request req;
     auto parts = split(line, '|');
-    trim_trailing_empty_token(parts);
+    trim_trailing_empty(parts);
 
+    // Expect: MRLLN|REQ_...|p1|p2|
     if (parts.size() < 2) {
-        req.valid_magic = false;
+        req.type = RequestType::INVALID;
         return req;
     }
 
-    // Magic check
-    if (parts[0] != PROTOCOL_MAGIC) {
+    const std::string magic = parts[0];
+    if (magic != PROTOCOL_MAGIC) {
         req.valid_magic = false;
+        req.type = RequestType::INVALID;
         return req;
     }
 
-    const std::string& tag = parts[1];
+    const std::string tag = parts[1];
 
     if (tag == "REQ_LOGIN") req.type = RequestType::LOGIN;
     else if (tag == "REQ_LOGOUT") req.type = RequestType::LOGOUT;
@@ -47,144 +46,96 @@ Request parse_request_line(const std::string& line) {
     else if (tag == "REQ_MOVE") req.type = RequestType::MOVE;
     else if (tag == "REQ_REMATCH") req.type = RequestType::REMATCH;
     else if (tag == "REQ_STATE") req.type = RequestType::STATE;
-    else if (tag == "REQ_PING") req.type = RequestType::PING;
+    else if (tag == "REQ_PONG") req.type = RequestType::PONG;
     else req.type = RequestType::INVALID;
 
-    for (size_t i = 2; i < parts.size(); ++i) {
-        if (!parts[i].empty()) { // be defensive
-            req.params.push_back(parts[i]);
-        }
+    for (size_t i = 2; i < parts.size(); i++) {
+        req.params.push_back(parts[i]);
     }
 
     return req;
 }
 
-//
-// ---- Response prefix helper ----
-// Always emits trailing '|' so wire is consistent with your Python client.
-//
-static std::string prefix(const std::string& body_without_trailing_pipe) {
-    return std::string(PROTOCOL_MAGIC) + "|" + body_without_trailing_pipe + "|";
+static std::string prefix(const std::string& body) {
+    // Always keep trailing delimiter '|' to match the original wire format.
+    return std::string(PROTOCOL_MAGIC) + "|" + body + "|";
 }
 
-//
-// ---- OK responses ----
-//
+namespace Responses {
 
-std::string Responses::login_ok(int userId) {
+std::string login_ok(int userId) {
     return prefix("RES_LOGIN_OK|" + std::to_string(userId));
 }
 
-std::string Responses::login_fail() {
+std::string login_fail() {
     return prefix("RES_LOGIN_FAIL");
 }
 
-std::string Responses::logout_ok() {
+std::string logout_ok() {
     return prefix("RES_LOGOUT_OK");
 }
 
-std::string Responses::lobby_created(int lobbyId) {
+std::string lobby_created(int lobbyId) {
     return prefix("RES_LOBBY_CREATED|" + std::to_string(lobbyId));
 }
 
-std::string Responses::lobby_joined(const std::string& lobbyName) {
+std::string lobby_joined(const std::string& lobbyName) {
     return prefix("RES_LOBBY_JOINED|" + lobbyName);
 }
 
-std::string Responses::lobby_left() {
+std::string lobby_left() {
     return prefix("RES_LOBBY_LEFT");
 }
 
-std::string Responses::move_accepted(const std::string& moveStr) {
-    return prefix("RES_MOVE|" + moveStr);
-}
-
-std::string Responses::game_started() {
+std::string game_started() {
     return prefix("RES_GAME_STARTED");
 }
 
-std::string Responses::round_result(int winnerUserId,
-                                    const std::string& p1Move,
-                                    const std::string& p2Move)
-{
-    return prefix(
-        "RES_ROUND_RESULT|" +
-        std::to_string(winnerUserId) + "|" + p1Move + "|" + p2Move
-    );
+std::string move_accepted(const std::string& moveStr) {
+    return prefix("RES_MOVE|" + moveStr);
 }
 
-std::string Responses::match_result(int winnerUserId,
-                                    int p1Wins,
-                                    int p2Wins)
-{
-    return prefix(
-        "RES_MATCH_RESULT|" +
-        std::to_string(winnerUserId) + "|" +
-        std::to_string(p1Wins) + "|" +
-        std::to_string(p2Wins)
-    );
+std::string round_result(int winnerUserId,
+                         const std::string& p1Move,
+                         const std::string& p2Move) {
+    return prefix("RES_ROUND_RESULT|" + std::to_string(winnerUserId) + "|" + p1Move + "|" + p2Move);
 }
 
-std::string Responses::rematch_ready() {
+std::string match_result(int winnerUserId,
+                         int p1Wins,
+                         int p2Wins) {
+    return prefix("RES_MATCH_RESULT|" + std::to_string(winnerUserId) + "|" + std::to_string(p1Wins) + "|" + std::to_string(p2Wins));
+}
+
+std::string rematch_ready() {
     return prefix("RES_REMATCH_READY");
 }
 
-std::string Responses::game_cannot_continue(const std::string& reason) {
+std::string game_cannot_continue(const std::string& reason) {
     return prefix("RES_GAME_CANNOT_CONTINUE|" + reason);
 }
 
-std::string Responses::state(const std::string& debug) {
+std::string state(const std::string& debug) {
     return prefix("RES_STATE|" + debug);
 }
 
-std::string Responses::pong() {
-    return prefix("RES_PONG");
+std::string ping(const std::string& nonce) {
+    return prefix("RES_PING|" + nonce);
 }
 
-//
-// ---- ERROR RESPONSES ----
-//
+std::string error_unexpected_state() { return prefix("RES_ERROR|Unexpected request in current session state"); }
+std::string error_invalid_magic()     { return prefix("RES_ERROR|Invalid protocol magic"); }
+std::string error_invalid_move()      { return prefix("RES_ERROR|Invalid move"); }
+std::string error_not_in_lobby()      { return prefix("RES_ERROR|Not in lobby"); }
+std::string error_lobby_full()        { return prefix("RES_ERROR|Lobby full"); }
+std::string error_lobby_not_found()   { return prefix("RES_ERROR|Lobby not found"); }
+std::string error_unknown_request()   { return prefix("RES_ERROR|Unknown request"); }
+std::string error_not_in_game()       { return prefix("RES_ERROR|Not in game"); }
+std::string error_rematch_not_allowed(){ return prefix("RES_ERROR|Rematch not allowed"); }
+std::string error_malformed_request() { return prefix("RES_ERROR|Malformed request"); }
 
-std::string Responses::error_unexpected_state() {
-    return prefix("RES_ERROR|Unexpected request in current session state");
-}
-
-std::string Responses::error_invalid_magic() {
-    return prefix("RES_ERROR|Invalid protocol magic");
-}
-
-std::string Responses::error_invalid_move() {
-    return prefix("RES_ERROR|Invalid or unknown move");
-}
-
-std::string Responses::error_not_in_lobby() {
-    return prefix("RES_ERROR|Player not in lobby");
-}
-
-std::string Responses::error_lobby_full() {
-    return prefix("RES_ERROR|Lobby already has 2 players");
-}
-
-std::string Responses::error_lobby_not_found() {
-    return prefix("RES_ERROR|Lobby not found");
-}
-
-std::string Responses::error_unknown_request() {
-    return prefix("RES_ERROR|Unknown or malformed request");
-}
-
-std::string Responses::error_not_in_game() {
-    return prefix("RES_ERROR|Player not currently in a game");
-}
-
-std::string Responses::error_rematch_not_allowed() {
-    return prefix("RES_ERROR|Rematch only allowed after match completion");
-}
-
-std::string Responses::error_malformed_request() {
-    return prefix("RES_ERROR|Malformed request syntax");
-}
-
-std::string Responses::error(const std::string& msg) {
+std::string error(const std::string& msg) {
     return prefix("RES_ERROR|" + msg);
 }
+
+} // namespace Responses

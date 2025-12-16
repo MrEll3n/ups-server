@@ -9,26 +9,27 @@ enum class RequestType {
     LOGIN,
     LOGOUT,
     CREATE_LOBBY,
-    JOIN_LOBBY,     // params: lobbyName
+    JOIN_LOBBY,
     LEAVE_LOBBY,
-    MOVE,           // params: R/P/S
+    MOVE,
     REMATCH,
     STATE,
-    PING,
+    // Heartbeat initiated by server: server sends RES_PING|nonce|, client answers REQ_PONG|nonce|
+    PONG,
     INVALID
 };
 
 struct Request {
     RequestType type{RequestType::INVALID};
     std::vector<std::string> params;
-    bool valid_magic{true};   // false = bad/missing magic => close connection
+    bool valid_magic{true};   // false = bad / missing magic, we should close connection
 };
 
 Request parse_request_line(const std::string& line);
 
 namespace Responses {
 
-    // ---- OK responses ----
+    // ---- Standard OK responses ----
     std::string login_ok(int userId);
     std::string login_fail();
 
@@ -42,12 +43,10 @@ namespace Responses {
 
     std::string move_accepted(const std::string& moveStr);
 
-    // winnerUserId: 0 = draw, otherwise internal playerId
     std::string round_result(int winnerUserId,
                              const std::string& p1Move,
                              const std::string& p2Move);
 
-    // winnerUserId: 0 = draw, otherwise internal playerId
     std::string match_result(int winnerUserId,
                              int p1Wins,
                              int p2Wins);
@@ -58,7 +57,8 @@ namespace Responses {
 
     std::string state(const std::string& debug);
 
-    std::string pong();
+    // Server heartbeat (client must reply with REQ_PONG|same_nonce|)
+    std::string ping(const std::string& nonce);
 
     // ---- Error responses ----
     std::string error_unexpected_state();
@@ -71,6 +71,6 @@ namespace Responses {
     std::string error_not_in_game();
     std::string error_rematch_not_allowed();
     std::string error_malformed_request();
-    std::string error(const std::string& msg);
+    std::string error(const std::string& msg); // generic
 
 }

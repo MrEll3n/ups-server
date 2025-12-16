@@ -1,21 +1,26 @@
 #pragma once
+
 #include <string>
 
-enum class Move {
-    None,
-    Rock,
-    Paper,
-    Scissors
+enum class MoveType {
+    NONE,
+    ROCK,
+    PAPER,
+    SCISSORS
 };
 
-enum class PlayerState {
-    Connected,
-    LoggedIn,
-    InLobby,
-};
+inline std::string move_to_string(MoveType m) {
+    switch (m) {
+        case MoveType::ROCK: return "R";
+        case MoveType::PAPER: return "P";
+        case MoveType::SCISSORS: return "S";
+        default: return "";
+    }
+}
 
-struct MatchResult {
-    int winnerUserId; // 0 = draw
-    int p1Wins;
-    int p2Wins;
-};
+inline bool string_to_move(const std::string& s, MoveType& out) {
+    if (s == "R") { out = MoveType::ROCK; return true; }
+    if (s == "P") { out = MoveType::PAPER; return true; }
+    if (s == "S") { out = MoveType::SCISSORS; return true; }
+    return false;
+}

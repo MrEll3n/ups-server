@@ -1,272 +1,206 @@
 #include "Game.hpp"
-#include <algorithm>
 
 int Game::addPlayer(const std::string& username) {
-    int id = nextPlayerId++;
-    Player p;
-    p.id = id;
-    p.username = username;
-    p.state = PlayerState::LoggedIn;
-    players[id] = p;
+    int id = nextUserId++;
+    players[id] = Player{id, username};
     return id;
 }
 
-void Game::removePlayer(int playerId) {
-    auto it = players.find(playerId);
-    if (it == players.end()) return;
-
-    if (it->second.lobbyId != -1) {
-        leaveLobby(playerId);
+void Game::removePlayer(int userId) {
+    // Remove player from any lobby
+    auto lobbyOpt = getLobbyOf(userId);
+    if (lobbyOpt.has_value()) {
+        leaveLobby(userId);
     }
-    players.erase(it);
+    players.erase(userId);
 }
 
-int Game::createLobby(int ownerPlayerId, const std::string& name) {
-    int id = nextLobbyId++;
+std::optional<int> Game::createLobby(int userId, const std::string& lobbyName) {
+    auto lobbyOpt = getLobbyOf(userId);
+    if (lobbyOpt.has_value()) return std::nullopt; // already in a lobby
+
     Lobby lobby;
-    lobby.id = id;
-    lobby.name = name;
-    lobby.players.clear();
-    lobby.players.push_back(ownerPlayerId);
-
-    lobby.phase = LobbyPhase::WaitingForOpponent;
-    lobby.p1Wins = 0;
-    lobby.p2Wins = 0;
-    lobby.roundsPlayed = 0;
-
-    lobbies[id] = lobby;
-
-    Player* p = getPlayer(ownerPlayerId);
-    if (p) {
-        p->lobbyId = id;
-        p->state = PlayerState::InLobby;
-        p->currentMove = Move::None;
-        p->wantsRematch = false;
-    }
-    return id;
+    lobby.lobbyId = nextLobbyId++;
+    lobby.name = lobbyName;
+    lobby.players.push_back(players.at(userId));
+    lobbies[lobby.lobbyId] = lobby;
+    return lobby.lobbyId;
 }
 
-bool Game::joinLobby(int playerId, const std::string& lobbyName) {
-    int foundId = -1;
-    for (auto& [id, lobby] : lobbies) {
+bool Game::joinLobby(int userId, const std::string& lobbyName) {
+    auto lobbyOpt = getLobbyOf(userId);
+    if (lobbyOpt.has_value()) return false; // already in a lobby
+
+    for (auto& kv : lobbies) {
+        Lobby& lobby = kv.second;
         if (lobby.name == lobbyName) {
-            foundId = id;
-            break;
+            if (lobby.players.size() >= 2) return false;
+            lobby.players.push_back(players.at(userId));
+            return true;
         }
     }
-    if (foundId == -1) return false;
-
-    Lobby& lobby = lobbies[foundId];
-    if (lobby.players.size() >= 2) return false;
-
-    lobby.players.push_back(playerId);
-
-    // If lobby is now full, start match in a clean state
-    if (lobby.players.size() == 2) {
-        lobby.phase = LobbyPhase::InGame;
-        lobby.p1Wins = 0;
-        lobby.p2Wins = 0;
-        lobby.roundsPlayed = 0;
-
-        // Reset both players round state
-        Player* p1 = getPlayer(lobby.players[0]);
-        Player* p2 = getPlayer(lobby.players[1]);
-        if (p1) { p1->currentMove = Move::None; p1->wantsRematch = false; }
-        if (p2) { p2->currentMove = Move::None; p2->wantsRematch = false; }
-    }
-
-    Player* p = getPlayer(playerId);
-    if (p) {
-        p->lobbyId = foundId;
-        p->state = PlayerState::InLobby;
-        p->currentMove = Move::None;
-        p->wantsRematch = false;
-    }
-    return true;
+    return false;
 }
 
-void Game::leaveLobby(int playerId) {
-    Player* leaving = getPlayer(playerId);
-    if (!leaving || leaving->lobbyId == -1) {
-        return;
-    }
-
-    int lobbyId = leaving->lobbyId;
-
-    auto lit = lobbies.find(lobbyId);
-    if (lit != lobbies.end()) {
-        Lobby& lobby = lit->second;
-
-        lobby.players.erase(
-            std::remove(lobby.players.begin(), lobby.players.end(), playerId),
-            lobby.players.end()
-        );
-
-        // In your design: if anyone leaves, the lobby is destroyed and remaining player is kicked out.
-        if (!lobby.players.empty()) {
-            for (int otherId : lobby.players) {
-                Player* other = getPlayer(otherId);
-                if (other) {
-                    other->lobbyId = -1;
-                    other->state = PlayerState::LoggedIn;
-                    other->currentMove = Move::None;
-                    other->wantsRematch = false;
+void Game::leaveLobby(int userId) {
+    for (auto it = lobbies.begin(); it != lobbies.end(); ++it) {
+        Lobby& lobby = it->second;
+        for (size_t i = 0; i < lobby.players.size(); i++) {
+            if (lobby.players[i].userId == userId) {
+                lobby.players.erase(lobby.players.begin() + static_cast<long>(i));
+                // If lobby empty, erase it
+                if (lobby.players.empty()) {
+                    lobbies.erase(it);
+                } else {
+                    // Reset game state when someone leaves
+                    lobby.inGame = false;
+                    lobby.p1Move = MoveType::NONE;
+                    lobby.p2Move = MoveType::NONE;
+                    lobby.p1Wins = 0;
+                    lobby.p2Wins = 0;
+                    lobby.roundsPlayed = 0;
+                    lobby.p1Rematch = false;
+                    lobby.p2Rematch = false;
                 }
+                return;
             }
         }
-
-        lobbies.erase(lit);
     }
-
-    leaving->lobbyId = -1;
-    leaving->state = PlayerState::LoggedIn;
-    leaving->currentMove = Move::None;
-    leaving->wantsRematch = false;
 }
 
-std::optional<RoundResult> Game::submitMove(int playerId, Move move) {
-    Player* p = getPlayer(playerId);
-    if (!p || p->lobbyId == -1) return std::nullopt;
-
-    Lobby* lobby = getLobby(p->lobbyId);
-    if (!lobby) return std::nullopt;
-
-    // Must be exactly 2 players and match must be running
-    if (lobby->players.size() != 2) return std::nullopt;
-    if (lobby->phase != LobbyPhase::InGame) return std::nullopt;
-
-    p->currentMove = move;
-    p->wantsRematch = false;
-
-    Player* p1 = getPlayer(lobby->players[0]);
-    Player* p2 = getPlayer(lobby->players[1]);
-    if (!p1 || !p2) return std::nullopt;
-
-    // Wait for both moves
-    if (p1->currentMove == Move::None || p2->currentMove == Move::None)
-        return std::nullopt;
-
-    int res = evaluateRound(p1->currentMove, p2->currentMove);
-
-    RoundResult rr;
-    rr.p1Move = p1->currentMove;
-    rr.p2Move = p2->currentMove;
-    rr.p1UserId = p1->id;
-    rr.p2UserId = p2->id;
-
-    if (res == 1) {
-        rr.winnerUserId = p1->id;
-        lobby->p1Wins++;
+std::optional<Lobby*> Game::getLobbyOf(int userId) {
+    for (auto& kv : lobbies) {
+        Lobby& lobby = kv.second;
+        for (auto& p : lobby.players) {
+            if (p.userId == userId) return &lobby;
+        }
     }
-    else if (res == 2) {
-        rr.winnerUserId = p2->id;
-        lobby->p2Wins++;
-    }
-    else {
-        rr.winnerUserId = 0; // draw
-    }
-
-    lobby->roundsPlayed++;
-
-    // Reset moves for the next round
-    p1->currentMove = Move::None;
-    p2->currentMove = Move::None;
-
-    return rr;
+    return std::nullopt;
 }
 
-bool Game::requestRematch(int playerId) {
-    Player* p = getPlayer(playerId);
-    if (!p || p->lobbyId == -1) return false;
+bool Game::canStartGame(Lobby* lobby) const {
+    return lobby && lobby->players.size() == 2 && !lobby->inGame;
+}
 
-    Lobby* lobby = getLobby(p->lobbyId);
-    if (!lobby || lobby->players.size() != 2) return false;
-
-    // Rematch only after match finished
-    if (lobby->phase != LobbyPhase::AfterMatch) {
-        return false;
-    }
-
-    p->wantsRematch = true;
-
-    Player* p1 = getPlayer(lobby->players[0]);
-    Player* p2 = getPlayer(lobby->players[1]);
-    if (!p1 || !p2) return false;
-
-    if (!(p1->wantsRematch && p2->wantsRematch)) {
-        return false;
-    }
-
-    // Full deterministic reset
+void Game::startGame(Lobby* lobby) {
+    if (!lobby) return;
+    lobby->inGame = true;
+    lobby->p1Move = MoveType::NONE;
+    lobby->p2Move = MoveType::NONE;
     lobby->p1Wins = 0;
     lobby->p2Wins = 0;
     lobby->roundsPlayed = 0;
-    lobby->phase = LobbyPhase::InGame;
+    lobby->p1Rematch = false;
+    lobby->p2Rematch = false;
+}
 
-    p1->currentMove = Move::None;
-    p2->currentMove = Move::None;
-    p1->wantsRematch = false;
-    p2->wantsRematch = false;
+int Game::evaluate_round(MoveType p1, MoveType p2) const {
+    // returns: 0 draw, 1 p1 wins, 2 p2 wins
+    if (p1 == p2) return 0;
+    if (p1 == MoveType::ROCK && p2 == MoveType::SCISSORS) return 1;
+    if (p1 == MoveType::PAPER && p2 == MoveType::ROCK) return 1;
+    if (p1 == MoveType::SCISSORS && p2 == MoveType::PAPER) return 1;
+    return 2;
+}
+
+bool Game::checkMatchEnd(Lobby* lobby, int& outWinnerUserId) const {
+    if (!lobby) return false;
+
+    // Fixed 3-round match: always play exactly 3 rounds, then decide winner by total wins.
+    if (lobby->roundsPlayed == 3) {
+        if (lobby->p1Wins > lobby->p2Wins) outWinnerUserId = lobby->players[0].userId;
+        else if (lobby->p2Wins > lobby->p1Wins) outWinnerUserId = lobby->players[1].userId;
+        else outWinnerUserId = 0;
+        return true;
+    }
+    return false;
+}
+
+bool Game::submitMove(int userId, MoveType move,
+                      int& outRoundWinnerUserId,
+                      MoveType& outP1Move,
+                      MoveType& outP2Move,
+                      bool& outMatchEnded,
+                      int& outMatchWinnerUserId,
+                      int& outP1Wins,
+                      int& outP2Wins) {
+
+    outRoundWinnerUserId = 0;
+    outMatchEnded = false;
+    outMatchWinnerUserId = 0;
+
+    auto lobbyOpt = getLobbyOf(userId);
+    if (!lobbyOpt.has_value()) return false;
+    Lobby* lobby = lobbyOpt.value();
+    if (!lobby || !lobby->inGame) return false;
+    if (lobby->players.size() != 2) return false;
+
+    const int p1Id = lobby->players[0].userId;
+    const int p2Id = lobby->players[1].userId;
+
+    if (userId == p1Id) lobby->p1Move = move;
+    else if (userId == p2Id) lobby->p2Move = move;
+    else return false;
+
+    // If both moves are in, resolve round
+    if (lobby->p1Move != MoveType::NONE && lobby->p2Move != MoveType::NONE) {
+        int winner = evaluate_round(lobby->p1Move, lobby->p2Move);
+
+        if (winner == 1) lobby->p1Wins++;
+        else if (winner == 2) lobby->p2Wins++;
+
+        lobby->roundsPlayed++;
+
+        // Winner userId (0 for draw)
+        if (winner == 1) outRoundWinnerUserId = p1Id;
+        else if (winner == 2) outRoundWinnerUserId = p2Id;
+        else outRoundWinnerUserId = 0;
+
+        outP1Move = lobby->p1Move;
+        outP2Move = lobby->p2Move;
+
+        // Reset moves for next round
+        lobby->p1Move = MoveType::NONE;
+        lobby->p2Move = MoveType::NONE;
+
+        // Match end?
+        int matchWinner = 0;
+        if (checkMatchEnd(lobby, matchWinner)) {
+            outMatchEnded = true;
+            outMatchWinnerUserId = matchWinner;
+            outP1Wins = lobby->p1Wins;
+            outP2Wins = lobby->p2Wins;
+            lobby->inGame = false;
+        } else {
+            outP1Wins = lobby->p1Wins;
+            outP2Wins = lobby->p2Wins;
+        }
+    }
 
     return true;
 }
 
-const Player* Game::getPlayer(int playerId) const {
-    auto it = players.find(playerId);
-    if (it == players.end()) return nullptr;
-    return &it->second;
+bool Game::requestRematch(int userId, Lobby* lobby) {
+    if (!lobby) return false;
+    if (lobby->players.size() != 2) return false;
+    if (lobby->inGame) return false;
+
+    const int p1Id = lobby->players[0].userId;
+    const int p2Id = lobby->players[1].userId;
+
+    if (userId == p1Id) lobby->p1Rematch = true;
+    else if (userId == p2Id) lobby->p2Rematch = true;
+    else return false;
+
+    return true;
 }
 
-Player* Game::getPlayer(int playerId) {
-    auto it = players.find(playerId);
-    if (it == players.end()) return nullptr;
-    return &it->second;
+bool Game::canStartRematch(Lobby* lobby) const {
+    if (!lobby) return false;
+    if (lobby->players.size() != 2) return false;
+    return lobby->p1Rematch && lobby->p2Rematch;
 }
 
-const Lobby* Game::getLobby(int lobbyId) const {
-    auto it = lobbies.find(lobbyId);
-    if (it == lobbies.end()) return nullptr;
-    return &it->second;
-}
-
-Lobby* Game::getLobby(int lobbyId) {
-    auto it = lobbies.find(lobbyId);
-    if (it == lobbies.end()) return nullptr;
-    return &it->second;
-}
-
-int Game::evaluateRound(Move a, Move b) const {
-    if (a == b) return 0;
-    if ((a == Move::Rock     && b == Move::Scissors) ||
-        (a == Move::Scissors && b == Move::Paper)    ||
-        (a == Move::Paper    && b == Move::Rock)) {
-        return 1;
-    }
-    return 2;
-}
-
-std::optional<MatchResult> Game::checkMatchEnd(int lobbyId) {
-    Lobby* lobby = getLobby(lobbyId);
-    if (!lobby) return std::nullopt;
-
-    if (lobby->phase != LobbyPhase::InGame) {
-        return std::nullopt;
-    }
-
-    // Best-of-3: first to 2 wins OR max 3 rounds
-    if (lobby->p1Wins == 2 || lobby->p2Wins == 2 || lobby->roundsPlayed == 3) {
-        MatchResult mr;
-
-        if (lobby->p1Wins > lobby->p2Wins) mr.winnerUserId = lobby->players[0];
-        else if (lobby->p2Wins > lobby->p1Wins) mr.winnerUserId = lobby->players[1];
-        else mr.winnerUserId = 0;
-
-        mr.p1Wins = lobby->p1Wins;
-        mr.p2Wins = lobby->p2Wins;
-
-        lobby->phase = LobbyPhase::AfterMatch;
-        return mr;
-    }
-
-    return std::nullopt;
+void Game::startRematch(Lobby* lobby) {
+    startGame(lobby);
 }

@@ -1,79 +1,68 @@
 #pragma once
-#include <string>
+
+#include "GameTypes.hpp"
+
 #include <unordered_map>
 #include <vector>
 #include <optional>
-#include "GameTypes.hpp"
-
-enum class LobbyPhase {
-    WaitingForOpponent,
-    InGame,
-    AfterMatch
-};
 
 struct Player {
-    int id;                     // internal player id
+    int userId;
     std::string username;
-    PlayerState state = PlayerState::Connected;
-
-    int lobbyId = -1;           // -1 = no lobby
-    Move currentMove = Move::None;
-    bool wantsRematch = false;
 };
 
 struct Lobby {
-    int id;
+    int lobbyId;
     std::string name;
-    std::vector<int> players;   // 2 players only
+    std::vector<Player> players; // size 0..2
 
-    LobbyPhase phase = LobbyPhase::WaitingForOpponent;
+    bool inGame{false};
 
-    // Best-of-3 scoreboard
-    int p1Wins = 0;
-    int p2Wins = 0;
-    int roundsPlayed = 0;
-};
+    MoveType p1Move{MoveType::NONE};
+    MoveType p2Move{MoveType::NONE};
 
-struct RoundResult {
-    int winnerUserId = 0; // 0 = draw
-    Move p1Move = Move::None;
-    Move p2Move = Move::None;
-    int p1UserId = 0;
-    int p2UserId = 0;
+    int p1Wins{0};
+    int p2Wins{0};
+    int roundsPlayed{0};
+
+    bool p1Rematch{false};
+    bool p2Rematch{false};
 };
 
 class Game {
 public:
-    Game() = default;
-
-    // Player management
     int addPlayer(const std::string& username);
-    void removePlayer(int playerId);
+    void removePlayer(int userId);
 
-    // Lobby management
-    int createLobby(int ownerPlayerId, const std::string& name);
-    bool joinLobby(int playerId, const std::string& lobbyName);
-    void leaveLobby(int playerId);
+    std::optional<int> createLobby(int userId, const std::string& lobbyName);
+    bool joinLobby(int userId, const std::string& lobbyName);
+    void leaveLobby(int userId);
 
-    // Gameplay
-    std::optional<RoundResult> submitMove(int playerId, Move move);
-    bool requestRematch(int playerId);
+    std::optional<Lobby*> getLobbyOf(int userId);
 
-    std::optional<MatchResult> checkMatchEnd(int lobbyId);
+    bool canStartGame(Lobby* lobby) const;
+    void startGame(Lobby* lobby);
 
-    // Access helpers
-    const Player* getPlayer(int playerId) const;
-    Player* getPlayer(int playerId);
+    bool submitMove(int userId, MoveType move,
+                    int& outRoundWinnerUserId,
+                    MoveType& outP1Move,
+                    MoveType& outP2Move,
+                    bool& outMatchEnded,
+                    int& outMatchWinnerUserId,
+                    int& outP1Wins,
+                    int& outP2Wins);
 
-    const Lobby* getLobby(int lobbyId) const;
-    Lobby* getLobby(int lobbyId);
+    bool requestRematch(int userId, Lobby* lobby);
+    bool canStartRematch(Lobby* lobby) const;
+    void startRematch(Lobby* lobby);
 
 private:
     std::unordered_map<int, Player> players;
     std::unordered_map<int, Lobby> lobbies;
 
-    int nextPlayerId = 1;
-    int nextLobbyId = 1;
+    int nextUserId{1};
+    int nextLobbyId{1};
 
-    int evaluateRound(Move a, Move b) const; // 0 draw, 1 first wins, 2 second wins
+    int evaluate_round(MoveType p1, MoveType p2) const;
+    bool checkMatchEnd(Lobby* lobby, int& outWinnerUserId) const;
 };
