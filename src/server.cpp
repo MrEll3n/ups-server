@@ -12,6 +12,8 @@
 #include <chrono>
 #include <random>
 #include <ctime>
+#include <map>
+#include <set>
 
 static std::string phase_to_debug(SessionPhase ph) {
     switch (ph) {
@@ -23,6 +25,26 @@ static std::string phase_to_debug(SessionPhase ph) {
         case SessionPhase::INVALID:          return "Invalid"; // PŘIDANÉ: Ošetření INVALID
     }
     return "Unknown";
+}
+
+static std::map<int, std::string> g_online_users;
+
+static std::set<std::string> g_active_lobbies;
+
+void try_free_lobby_name(Game& game, int userId) {
+    auto lobbyOpt = game.getLobbyOf(userId);
+    if (lobbyOpt.has_value()) {
+        Lobby* lobby = lobbyOpt.value();
+        // Pokud je hráč poslední v lobby (size == 1), lobby po jeho odchodu zanikne.
+        // Musíme tedy uvolnit její jméno.
+        if (lobby->players.size() <= 1) {
+            // Předpokládáme, že struktura Lobby má atribut 'name'.
+            // Většinou se to jmenuje 'name' nebo 'lobbyName'.
+            // Pokud vám to zde hodí chybu, podívejte se do Game.hpp, jak se ta proměnná jmenuje.
+            g_active_lobbies.erase(lobby->name);
+            std::cerr << "[SYS] Lobby '" << lobby->name << "' is empty and destroyed. Name released.\n";
+        }
+    }
 }
 
 Server::Server(int port, bool enable_heartbeat, bool hb_logs)
@@ -145,6 +167,7 @@ bool Server::is_request_allowed(SessionPhase phase, RequestType type) const {
 
         case SessionPhase::InGame:
             return (type == RequestType::LOGOUT      ||
+                    type == RequestType::LEAVE_LOBBY ||
                     type == RequestType::MOVE        ||
                     type == RequestType::PONG        ||
                     type == RequestType::STATE);
@@ -168,30 +191,38 @@ void Server::notify_lobby_peers_player_left(int playerId, const std::string& rea
     Lobby* lobby = lobbyOpt.value();
     if (!lobby) return;
 
-    // Najdeme soupeře (peers)
+    // 1. Najdeme všechny OSTATNÍ hráče v lobby (soupeře)
     std::vector<int> peerIds;
     for (auto& p : lobby->players) {
         if (p.userId == playerId) continue;
         peerIds.push_back(p.userId);
     }
 
-    // Pro každého soupeře:
+    // 2. Projdeme nalezené soupeře a vyhodíme je
     for (int peerId : peerIds) {
-        // 1. Najdeme jeho file descriptor a pošleme zprávy
+        // A) Pošleme jim zprávy přes socket
         for (auto& kv : fd_to_player) {
             if (kv.second == peerId) {
                 // Informujeme, proč hra končí
                 send_line(kv.first, Responses::game_cannot_continue(reason));
-                // Informujeme, že byl odhlášen z lobby (server ho vyhazuje)
+                // Informujeme, že je server vyhazuje z lobby
                 send_line(kv.first, Responses::lobby_left());
             }
         }
-        // 2. Skutečně ho vyhodíme z lobby v herní logice
+
+        // B) !!! DŮLEŽITÉ !!!
+        // Zkusíme uvolnit název lobby.
+        // Pokud je tento 'peer' posledním hráčem v lobby, lobby po jeho odchodu zanikne.
+        // Proto musíme jméno lobby smazat z 'g_active_lobbies' ještě předtím, než ho 'leaveLobby' zničí.
+        try_free_lobby_name(game, peerId);
+
+        // C) Vyhodíme hráče z lobby v herní logice
         game.leaveLobby(peerId);
     }
 }
 
 void Server::disconnect_fd(int fd, const std::string& reason) {
+    // 1. Vyčistit buffery a heartbeats
     heartbeats.erase(fd);
     client_buffers.erase(fd);
 
@@ -199,16 +230,23 @@ void Server::disconnect_fd(int fd, const std::string& reason) {
     if (it != fd_to_player.end()) {
         int userId = it->second;
 
-        // Zjistíme, jestli je hráč ve hře
+        // 2. Hráč je offline -> smazat ze seznamu aktivních jmen
+        // (Aby se toto jméno dalo hned použít pro Reconnect nebo Login)
+        g_online_users.erase(userId);
+
+        // 3. Zjistíme, jestli je hráč ve hře
         auto lobbyOpt = game.getLobbyOf(userId);
+
         if (lobbyOpt.has_value() && lobbyOpt.value()->inGame) {
-            // Hráč je ve hře -> SOFT DISCONNECT
+            // --- VARIANTA A: HRÁČ JE VE HŘE (SOFT DISCONNECT) ---
+            // Nerušíme lobby, neuvolňujeme jméno lobby, jen pozastavíme.
+
             std::cerr << "[SYS] User " << userId << " disconnected during game. Waiting for reconnect...\n";
 
-            // Uložíme čas odpojení
+            // Uložíme čas odpojení pro 15s timeout
             disconnected_players[userId] = std::chrono::steady_clock::now();
 
-            // Informujeme soupeře, ale NERUŠÍME hru
+            // Informujeme soupeře, že čekáme
             Lobby* lobby = lobbyOpt.value();
             for (auto& p : lobby->players) {
                 if (p.userId == userId) continue;
@@ -220,12 +258,22 @@ void Server::disconnect_fd(int fd, const std::string& reason) {
                 }
             }
         } else {
-            // Hráč není ve hře (je v lobby nebo menu) -> HARD DISCONNECT (staré chování)
+            // --- VARIANTA B: HRÁČ NENÍ VE HŘE (HARD DISCONNECT) ---
+            // Je v menu nebo v lobby (ale nehraje).
+
+            // !!! DŮLEŽITÉ: Pokud je v lobby, zkusíme uvolnit jméno lobby !!!
+            // (Pokud tam byl poslední, lobby zanikne a název musí být volný)
+            try_free_lobby_name(game, userId);
+
+            // Úplně odstraníme hráče ze hry
             game.removePlayer(userId);
         }
+
+        // Smazat mapování FD -> Player
         fd_to_player.erase(it);
     }
 
+    // 4. Zavřít socket
     close(fd);
     FD_CLR(fd, &master_set);
 }
@@ -239,42 +287,59 @@ void Server::check_disconnection_timeouts() {
         int userId = kv.first;
         auto disconnect_time = kv.second;
 
+        // Pokud uběhlo více než 15 sekund od odpojení
         if (duration_cast<seconds>(now - disconnect_time).count() > 15) {
-            // Čas vypršel -> HARD DISCONNECT
             std::cerr << "[SYS] Reconnect timeout for user " << userId << ". Ending match.\n";
 
-            // Informovat soupeře, že hra končí
+            // 1. Informovat soupeře (že vyhrál kontumačně) a vyhodit ho z lobby
+            // (Soupeř dostane zprávu RES_LOBBY_LEFT a přepne se do menu)
             notify_lobby_peers_player_left(userId, "Opponent timed out");
 
-            // Vymazat hráče z herní logiky
+            // 2. Uvolnit název lobby (protože v ní zůstal už jen tento odpojený hráč)
+            try_free_lobby_name(game, userId);
+
+            // 3. !!! POJISTKA: Vyhodit odpojeného hráče z lobby !!!
+            // Tím zajistíme, že v systému nezůstane viset vazba "Hráč <-> Lobby".
+            game.leaveLobby(userId);
+
+            // 4. Smazat hráče z paměti serveru
+            // Tím se z něj stane "neznámý". Pokud se znovu připojí, bude to nový login.
             game.removePlayer(userId);
 
             timed_out_users.push_back(userId);
         }
     }
 
+    // Vyčistit seznam timeoutů
     for (int uid : timed_out_users) {
         disconnected_players.erase(uid);
     }
 }
 
 int Server::find_disconnected_player_by_name(const std::string& name) {
-    // Projdeme všechny odpojené hráče
+    // Projdeme všechny hráče, kteří čekají na reconnect
     for (auto& kv : disconnected_players) {
         int uid = kv.first;
 
-        // Získáme lobby hráče, abychom zjistili jeho jméno
-        // (Protože disconnected_players mapuje jen ID -> Čas, jméno musíme vytáhnout z Game/Lobby)
+        // Protože v 'disconnected_players' máme jen ID a Čas,
+        // musíme se podívat do objektu 'game', abychom zjistili Jméno.
+        // Hráči v tomto seznamu jsou vždy "InGame", takže musí být v nějakém lobby.
         auto lobbyOpt = game.getLobbyOf(uid);
+
         if (lobbyOpt.has_value()) {
-            for (auto& p : lobbyOpt.value()->players) {
+            Lobby* lobby = lobbyOpt.value();
+            // Prohledáme hráče v lobby
+            for (auto& p : lobby->players) {
+                // Pokud ID sedí a Jméno sedí, našli jsme ho!
                 if (p.userId == uid && p.username == name) {
-                    return uid; // Našli jsme shodu jména!
+                    return uid;
                 }
             }
         }
     }
-    return -1; // Nenalezeno
+
+    // Žádný odpojený hráč s tímto jménem nebyl nalezen
+    return -1;
 }
 
 void Server::heartbeat_tick() {
@@ -378,33 +443,48 @@ void Server::handle_request(int fd, const Request& req) {
             }
             const std::string username = req.params[0];
 
-            // --- 1. POKUS O RECONNECT ---
-            // Zkontrolujeme, zda tento uživatel nečeká na reconnect (podle jména)
+            // --- 1. KONTROLA DUPLICITNÍHO JMÉNA (NOVÉ) ---
+            bool nameTaken = false;
+            for (const auto& kv : g_online_users) {
+                if (kv.second == username) {
+                    nameTaken = true;
+                    break;
+                }
+            }
+
+            if (nameTaken) {
+                // Jméno už je online na jiném socketu
+                send_line(fd, Responses::error("Name already in use"));
+                // Můžeme poslat i LOGIN_FAIL, pokud to klient podporuje lépe
+                // send_line(fd, "MRLLN|RES_LOGIN_FAIL|");
+                break;
+            }
+            // ----------------------------------------------
+
+            // --- 2. POKUS O RECONNECT ---
             int oldUserId = find_disconnected_player_by_name(username);
 
             if (oldUserId != -1) {
-                // JE TO RECONNECT!
                 std::cerr << "[SYS] User " << username << " reconnected (ID: " << oldUserId << ")\n";
 
-                // 1. Obnovíme vazbu File Descriptor -> PlayerID
                 fd_to_player[fd] = oldUserId;
-
-                // 2. Odstraníme ze seznamu odpojených (už je zpět)
                 disconnected_players.erase(oldUserId);
 
-                // 3. Pošleme LOGIN OK se starým ID
-                send_line(fd, Responses::login_ok(oldUserId));
+                // ZAPAMATOVAT SI, ŽE JE ZASE ONLINE
+                g_online_users[oldUserId] = username;
 
-                // 4. Informujeme hráče, že hra stále běží (přepne ho to do GameScene)
+                send_line(fd, Responses::login_ok(oldUserId));
                 send_line(fd, Responses::game_started());
 
-                // 5. Informujeme soupeře, že hra pokračuje (zmizí mu čekací obrazovka)
                 auto lobbyOpt = game.getLobbyOf(oldUserId);
                 if (lobbyOpt.has_value()) {
-                    for (auto& p : lobbyOpt.value()->players) {
-                        if (p.userId == oldUserId) continue; // to jsem já, přeskakujeme
+                    Lobby* lobby = lobbyOpt.value();
+                    // Reset tahů (jak jsme dělali minule)
+                    lobby->p1Move = MoveType::NONE;
+                    lobby->p2Move = MoveType::NONE;
 
-                        // Najdeme socket soupeře a pošleme mu zprávu
+                    for (auto& p : lobby->players) {
+                        if (p.userId == oldUserId) continue;
                         for (auto& kv : fd_to_player) {
                             if (kv.second == p.userId) {
                                 send_line(kv.first, Responses::game_resumed());
@@ -412,21 +492,21 @@ void Server::handle_request(int fd, const Request& req) {
                         }
                     }
                 }
-                // Reconnect vyřízen, vyskakujeme z case
                 break;
             }
 
-            // --- 2. STANDARDNÍ LOGIN (NOVÝ HRÁČ) ---
-
-            // Pokud je socket už přihlášený (chyba stavu)
+            // --- 3. NOVÝ HRÁČ ---
             if (fd_to_player.find(fd) != fd_to_player.end()) {
                 send_line(fd, Responses::error_unexpected_state());
                 break;
             }
 
-            // Vytvoříme nového hráče
             int userId = game.addPlayer(username);
             fd_to_player[fd] = userId;
+
+            // ZAPAMATOVAT SI ONLINE JMÉNO
+            g_online_users[userId] = username;
+
             send_line(fd, Responses::login_ok(userId));
             break;
         }
@@ -435,10 +515,27 @@ void Server::handle_request(int fd, const Request& req) {
             auto it = fd_to_player.find(fd);
             if (it != fd_to_player.end()) {
                 int userId = it->second;
+
+                // 1. Zkusíme uvolnit název lobby (pokud tímto odchodem zaniká)
+                try_free_lobby_name(game, userId);
+
+                // 2. Vyhodíme hráče ze hry explicitně
+                // (Aby disconnect_fd níže vyhodnotil situaci jako "Hard Disconnect"
+                // a nesnažil se ho udržet ve hře pro reconnect)
+                game.leaveLobby(userId);
                 game.removePlayer(userId);
-                fd_to_player.erase(it);
+
+                // !!! DŮLEŽITÉ !!!
+                // Zde NESMÍME volat 'fd_to_player.erase(it)'.
+                // Musíme to mapování nechat existovat ještě chvilku,
+                // aby si ho mohla přečíst funkce 'disconnect_fd' a podle ID
+                // smazat jméno z 'g_online_users'.
             }
+
+            // Potvrdíme klientovi
             send_line(fd, Responses::logout_ok());
+
+            // Odpojíme socket -> TATO funkce se postará o vymazání g_online_users i fd_to_player
             disconnect_fd(fd, "LOGOUT");
             break;
         }
@@ -451,11 +548,22 @@ void Server::handle_request(int fd, const Request& req) {
             int userId = fd_to_player[fd];
             const std::string lobbyName = req.params[0];
 
+            // --- 1. KONTROLA DUPLICITNÍHO NÁZVU LOBBY ---
+            if (g_active_lobbies.find(lobbyName) != g_active_lobbies.end()) {
+                send_line(fd, Responses::error("Lobby name already taken"));
+                break;
+            }
+            // ---------------------------------------------
+
             auto lobbyIdOpt = game.createLobby(userId, lobbyName);
             if (!lobbyIdOpt.has_value()) {
                 send_line(fd, Responses::error("Cannot create lobby"));
                 break;
             }
+
+            // --- 2. ZAREGISTROVAT JMÉNO LOBBY ---
+            g_active_lobbies.insert(lobbyName);
+            // ------------------------------------
 
             send_line(fd, Responses::lobby_created(*lobbyIdOpt));
             break;
@@ -495,19 +603,21 @@ void Server::handle_request(int fd, const Request& req) {
         }
 
         case RequestType::LEAVE_LOBBY: {
-                    int userId = fd_to_player[fd];
+            int userId = fd_to_player[fd];
 
-                    // 1. NEJPRVE informovat ostatní hráče (soupeře), že tento hráč odchází
-                    // Použijeme existující pomocnou funkci notify_lobby_peers_player_left
-                    notify_lobby_peers_player_left(userId, "Opponent left the lobby");
+            // 1. Informovat soupeře (pokud tam je)
+            notify_lobby_peers_player_left(userId, "Opponent left the lobby");
 
-                    // 2. Nyní bezpečně opustit lobby
-                    game.leaveLobby(userId);
+            // --- 2. POKUSIT SE UVOLNIT JMÉNO LOBBY (pokud zaniká) ---
+            try_free_lobby_name(game, userId);
+            // --------------------------------------------------------
 
-                    // 3. Potvrdit odcházejícímu hráči
-                    send_line(fd, Responses::lobby_left());
-                    break;
-                }
+            // 3. Opustit lobby
+            game.leaveLobby(userId);
+
+            send_line(fd, Responses::lobby_left());
+            break;
+        }
 
         case RequestType::MOVE: {
             if (req.params.size() != 1) {
