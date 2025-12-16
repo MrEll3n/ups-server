@@ -14,11 +14,13 @@ void print_usage(const char* prog_name) {
 }
 
 int main(int argc, char** argv) {
+    // Výchozí hodnoty
     std::string ip_address = "0.0.0.0";
     int port = 10000;
     bool enable_heartbeat = true;
     bool heartbeat_logs = false;
 
+    // Parsování argumentů
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
 
@@ -44,6 +46,7 @@ int main(int argc, char** argv) {
             print_usage(argv[0]);
             return 0;
         } else {
+            // Zpětná kompatibilita: pokud je to jen číslo, bereme to jako port
             try {
                 port = std::stoi(arg);
             } catch (...) {

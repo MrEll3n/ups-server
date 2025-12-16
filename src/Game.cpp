@@ -8,7 +8,6 @@ int Game::addPlayer(const std::string& username) {
 }
 
 void Game::removePlayer(int userId) {
-    // Remove player from any lobby
     auto lobbyOpt = getLobbyOf(userId);
     if (lobbyOpt.has_value()) {
         leaveLobby(userId);
@@ -18,7 +17,7 @@ void Game::removePlayer(int userId) {
 
 std::optional<int> Game::createLobby(int userId, const std::string& lobbyName) {
     auto lobbyOpt = getLobbyOf(userId);
-    if (lobbyOpt.has_value()) return std::nullopt; // already in a lobby
+    if (lobbyOpt.has_value()) return std::nullopt;
 
     Lobby lobby;
     lobby.lobbyId = nextLobbyId++;
@@ -30,7 +29,7 @@ std::optional<int> Game::createLobby(int userId, const std::string& lobbyName) {
 
 bool Game::joinLobby(int userId, const std::string& lobbyName) {
     auto lobbyOpt = getLobbyOf(userId);
-    if (lobbyOpt.has_value()) return false; // already in a lobby
+    if (lobbyOpt.has_value()) return false;
 
     for (auto& kv : lobbies) {
         Lobby& lobby = kv.second;
@@ -49,11 +48,9 @@ void Game::leaveLobby(int userId) {
         for (size_t i = 0; i < lobby.players.size(); i++) {
             if (lobby.players[i].userId == userId) {
                 lobby.players.erase(lobby.players.begin() + static_cast<long>(i));
-                // If lobby empty, erase it
                 if (lobby.players.empty()) {
                     lobbies.erase(it);
                 } else {
-                    // Reset game state when someone leaves
                     lobby.inGame = false;
                     lobby.matchJustEnded = false;
                     lobby.p1Move = MoveType::NONE;
@@ -98,7 +95,6 @@ void Game::startGame(Lobby* lobby) {
 }
 
 int Game::evaluate_round(MoveType p1, MoveType p2) const {
-    // returns: 0 draw, 1 p1 wins, 2 p2 wins
     if (p1 == p2) return 0;
     if (p1 == MoveType::ROCK && p2 == MoveType::SCISSORS) return 1;
     if (p1 == MoveType::PAPER && p2 == MoveType::ROCK) return 1;
@@ -108,8 +104,6 @@ int Game::evaluate_round(MoveType p1, MoveType p2) const {
 
 bool Game::checkMatchEnd(Lobby* lobby, int& outWinnerUserId) const {
     if (!lobby) return false;
-
-    // Fixed 3-round match: always play exactly 3 rounds, then decide winner by total wins.
     if (lobby->roundsPlayed == 3) {
         if (lobby->p1Wins > lobby->p2Wins) outWinnerUserId = lobby->players[0].userId;
         else if (lobby->p2Wins > lobby->p1Wins) outWinnerUserId = lobby->players[1].userId;
@@ -128,9 +122,13 @@ bool Game::submitMove(int userId, MoveType move,
                       int& outP1Wins,
                       int& outP2Wins) {
 
+    // --- FIX: Inicializace výstupů na NONE/0 ---
     outRoundWinnerUserId = 0;
     outMatchEnded = false;
     outMatchWinnerUserId = 0;
+    outP1Move = MoveType::NONE;
+    outP2Move = MoveType::NONE;
+    // -------------------------------------------
 
     auto lobbyOpt = getLobbyOf(userId);
     if (!lobbyOpt.has_value()) return false;
@@ -141,24 +139,16 @@ bool Game::submitMove(int userId, MoveType move,
     const int p1Id = lobby->players[0].userId;
     const int p2Id = lobby->players[1].userId;
 
-    // CRITICAL: Check if player already submitted a move this round
     if (userId == p1Id) {
-        if (lobby->p1Move != MoveType::NONE) {
-            // Player 1 already submitted - reject
-            return false;
-        }
+        if (lobby->p1Move != MoveType::NONE) return false;
         lobby->p1Move = move;
     } else if (userId == p2Id) {
-        if (lobby->p2Move != MoveType::NONE) {
-            // Player 2 already submitted - reject
-            return false;
-        }
+        if (lobby->p2Move != MoveType::NONE) return false;
         lobby->p2Move = move;
     } else {
         return false;
     }
 
-    // If both moves are in, resolve round
     if (lobby->p1Move != MoveType::NONE && lobby->p2Move != MoveType::NONE) {
         int winner = evaluate_round(lobby->p1Move, lobby->p2Move);
 
@@ -167,7 +157,6 @@ bool Game::submitMove(int userId, MoveType move,
 
         lobby->roundsPlayed++;
 
-        // Winner userId (0 for draw)
         if (winner == 1) outRoundWinnerUserId = p1Id;
         else if (winner == 2) outRoundWinnerUserId = p2Id;
         else outRoundWinnerUserId = 0;
@@ -175,11 +164,10 @@ bool Game::submitMove(int userId, MoveType move,
         outP1Move = lobby->p1Move;
         outP2Move = lobby->p2Move;
 
-        // Reset moves for next round
+        // Reset tahů pro další kolo
         lobby->p1Move = MoveType::NONE;
         lobby->p2Move = MoveType::NONE;
 
-        // Match end?
         int matchWinner = 0;
         if (checkMatchEnd(lobby, matchWinner)) {
             outMatchEnded = true;
@@ -187,7 +175,7 @@ bool Game::submitMove(int userId, MoveType move,
             outP1Wins = lobby->p1Wins;
             outP2Wins = lobby->p2Wins;
             lobby->inGame = false;
-            lobby->matchJustEnded = true; // PŘECHOD DO AFTER_GAME STAVU
+            lobby->matchJustEnded = true;
         } else {
             outP1Wins = lobby->p1Wins;
             outP2Wins = lobby->p2Wins;
@@ -201,7 +189,7 @@ bool Game::requestRematch(int userId, Lobby* lobby) {
     if (!lobby) return false;
     if (lobby->players.size() != 2) return false;
     if (lobby->inGame) return false;
-    if (!lobby->matchJustEnded) return false; // Povoleno jen v AFTER_GAME
+    if (!lobby->matchJustEnded) return false;
 
     const int p1Id = lobby->players[0].userId;
     const int p2Id = lobby->players[1].userId;
@@ -216,7 +204,7 @@ bool Game::requestRematch(int userId, Lobby* lobby) {
 bool Game::canStartRematch(Lobby* lobby) const {
     if (!lobby) return false;
     if (lobby->players.size() != 2) return false;
-    if (!lobby->matchJustEnded) return false; // Kontrola stavu AFTER_GAME
+    if (!lobby->matchJustEnded) return false;
     return lobby->p1Rematch && lobby->p2Rematch;
 }
 

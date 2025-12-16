@@ -514,9 +514,12 @@ void Server::handle_request(int fd, const Request& req) {
                 break;
             }
 
-            int rw, mw, p1w, p2w;
-            MoveType m1, m2;
-            bool me;
+            int rw = 0, mw = 0, p1w = 0, p2w = 0;
+            // !!! Fix: Inicializace na NONE !!!
+            MoveType m1 = MoveType::NONE;
+            MoveType m2 = MoveType::NONE;
+            bool me = false;
+
             if (!game.submitMove(userId, mv, rw, m1, m2, me, mw, p1w, p2w)) {
                 send_line(fd, Responses::error_not_in_game());
                 break;
