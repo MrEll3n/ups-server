@@ -19,10 +19,19 @@ enum class RequestType {
     INVALID
 };
 
+enum class SessionPhase {
+    NotLoggedIn,
+    LoggedInNoLobby,
+    InLobby,
+    InGame,
+    AFTER_GAME,   // PŘIDANÝ STAV
+    INVALID       // Ponecháme zde pro obsluhu v switch blocích
+};
+
 struct Request {
     RequestType type{RequestType::INVALID};
     std::vector<std::string> params;
-    bool valid_magic{true};   // false = bad / missing magic, we should close connection
+    bool valid_magic{true};
 };
 
 Request parse_request_line(const std::string& line);

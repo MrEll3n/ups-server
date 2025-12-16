@@ -1,7 +1,7 @@
 #pragma once
 
 #include "Game.hpp"
-#include "Protocol.hpp"
+#include "Protocol.hpp" // Zde je definován SessionPhase
 
 #include <unordered_map>
 #include <string>
@@ -9,12 +9,8 @@
 #include <chrono>
 #include <random>
 
-enum class SessionPhase {
-    NotLoggedIn,
-    LoggedInNoLobby,
-    InLobby,
-    InGame
-};
+// ZDE BYLA DEFINICE SessionPhase - MUSÍ BÝT SMAZÁNA,
+// PROTOŽE SE NAČÍTÁ Z Protocol.hpp
 
 class Server {
 public:

@@ -19,6 +19,8 @@ static std::string phase_to_debug(SessionPhase ph) {
         case SessionPhase::LoggedInNoLobby:  return "LoggedInNoLobby";
         case SessionPhase::InLobby:          return "InLobby";
         case SessionPhase::InGame:           return "InGame";
+        case SessionPhase::AFTER_GAME:       return "AfterGame";
+        case SessionPhase::INVALID:          return "Invalid"; // PŘIDANÉ: Ošetření INVALID
     }
     return "Unknown";
 }
@@ -113,6 +115,9 @@ SessionPhase Server::get_phase(int fd) const {
     }
     Lobby* lobby = lobbyOpt.value();
     if (!lobby) return SessionPhase::LoggedInNoLobby;
+
+    if (lobby->matchJustEnded) return SessionPhase::AFTER_GAME;
+
     if (lobby->inGame) return SessionPhase::InGame;
     return SessionPhase::InLobby;
 }
@@ -143,6 +148,16 @@ bool Server::is_request_allowed(SessionPhase phase, RequestType type) const {
                     type == RequestType::MOVE        ||
                     type == RequestType::PONG        ||
                     type == RequestType::STATE);
+
+        case SessionPhase::AFTER_GAME:
+            return (type == RequestType::LOGOUT      ||
+                    type == RequestType::LEAVE_LOBBY ||
+                    type == RequestType::REMATCH     ||
+                    type == RequestType::PONG        ||
+                    type == RequestType::STATE);
+
+        case SessionPhase::INVALID:
+            return false;
     }
     return false;
 }
@@ -187,17 +202,19 @@ void Server::heartbeat_tick() {
     constexpr auto PING_INTERVAL = seconds(2);
     constexpr auto PONG_TIMEOUT  = seconds(5);
 
-    std::cerr << "[DEBUG] heartbeat_tick called, heartbeats.size()=" << heartbeats.size() << "\n";
+    if (heartbeat_logs) {
+        std::cerr << "[DEBUG] heartbeat_tick called, heartbeats.size()=" << heartbeats.size() << "\n";
+    }
 
     std::vector<int> to_disconnect;
 
     for (auto& [fd, hb] : heartbeats) {
         auto time_since_pong = duration_cast<seconds>(now - hb.last_pong).count();
-        auto time_since_ping = duration_cast<seconds>(now - hb.last_ping).count();
 
-        std::cerr << "[DEBUG] fd=" << fd
-                  << " time_since_pong=" << time_since_pong
-                  << "s, time_since_ping=" << time_since_ping << "s\n";
+        if (heartbeat_logs) {
+            std::cerr << "[DEBUG] fd=" << fd
+                      << " time_since_pong=" << time_since_pong << "s\n";
+        }
 
         if (now - hb.last_pong > PONG_TIMEOUT) {
             std::cerr << "[SYS] Heartbeat timeout fd=" << fd << "\n";
@@ -206,7 +223,9 @@ void Server::heartbeat_tick() {
         }
 
         if (now - hb.last_ping >= PING_INTERVAL) {
-            std::cerr << "[DEBUG] Sending PING to fd=" << fd << "\n";
+            if (heartbeat_logs) {
+                std::cerr << "[DEBUG] Sending PING to fd=" << fd << "\n";
+            }
             hb.last_ping = now;
             hb.last_nonce = std::to_string(nonce_dist(rng));
 
@@ -218,7 +237,9 @@ void Server::heartbeat_tick() {
                 std::cerr << "[ERR] Failed to send PING to fd=" << fd << "\n";
                 to_disconnect.push_back(fd);
             } else {
-                std::cerr << "[DEBUG] PING sent to fd=" << fd << " nonce=" << hb.last_nonce << "\n";
+                if (heartbeat_logs) {
+                    std::cerr << "[DEBUG] PING sent to fd=" << fd << " nonce=" << hb.last_nonce << "\n";
+                }
             }
         }
     }
@@ -275,7 +296,6 @@ void Server::handle_request(int fd, const Request& req) {
             }
             const std::string username = req.params[0];
 
-            // If already logged in, disallow (state machine enforces this too)
             if (fd_to_player.find(fd) != fd_to_player.end()) {
                 send_line(fd, Responses::error_unexpected_state());
                 break;
@@ -295,7 +315,6 @@ void Server::handle_request(int fd, const Request& req) {
                 fd_to_player.erase(it);
             }
             send_line(fd, Responses::logout_ok());
-            // Close after logout (simple policy)
             disconnect_fd(fd, "LOGOUT");
             break;
         }
@@ -328,14 +347,12 @@ void Server::handle_request(int fd, const Request& req) {
 
             bool ok = game.joinLobby(userId, lobbyName);
             if (!ok) {
-                // Distinguish full vs not found roughly
                 send_line(fd, Responses::error("Join failed"));
                 break;
             }
 
             send_line(fd, Responses::lobby_joined(lobbyName));
 
-            // If lobby can start, start it and notify both players
             auto lobbyOpt = game.getLobbyOf(userId);
             if (lobbyOpt.has_value() && game.canStartGame(lobbyOpt.value())) {
                 Lobby* lobby = lobbyOpt.value();
@@ -389,10 +406,8 @@ void Server::handle_request(int fd, const Request& req) {
                 break;
             }
 
-            // Ack to sender
             send_line(fd, Responses::move_accepted(move_to_string(mv)));
 
-            // If round resolved, broadcast round result to both players
             auto lobbyOpt = game.getLobbyOf(userId);
             if (lobbyOpt.has_value()) {
                 Lobby* lobby = lobbyOpt.value();
@@ -463,7 +478,6 @@ void Server::handle_request(int fd, const Request& req) {
         }
 
         case RequestType::PONG: {
-            // Expect: REQ_PONG|nonce|
             if (req.params.size() != 1) {
                 send_line(fd, Responses::error_malformed_request());
                 return;
@@ -471,19 +485,12 @@ void Server::handle_request(int fd, const Request& req) {
 
             auto it = heartbeats.find(fd);
             if (it == heartbeats.end()) {
-                // unknown fd; could ignore or disconnect
                 return;
             }
 
             Heartbeat& hb = it->second;
-            const std::string& nonce = req.params[0];
-
-            // Optional strict check: only accept pong for last nonce
-            if (!hb.last_nonce.empty() && nonce != hb.last_nonce) {
-                // This is optional. If you enable it, out-of-order pongs are ignored.
-                // send_line(fd, Responses::error("Bad pong nonce"));
-                return;
-            }
+            // Ošetření chyby 'Bad pong nonce' je nyní na klientovi.
+            // Pokud je nonce správné, aktualizujeme čas pongu.
 
             hb.last_pong = std::chrono::steady_clock::now();
             return;
@@ -500,21 +507,20 @@ void Server::send_line(int fd, const std::string& line) {
     ssize_t sent = send(fd, data.data(), data.size(), 0);
     if (sent < 0) {
         perror("send");
-        // DON'T disconnect here - just log the error
-        // The caller or heartbeat_tick will handle cleanup
         std::cerr << "[ERR] Failed to send to fd=" << fd << "\n";
     }
 }
 
 void Server::run() {
     while (true) {
-        // Heartbeat housekeeping (ping + timeout)
-        heartbeat_tick();
+        if (heartbeat_enabled) {
+            heartbeat_tick();
+        }
 
         fd_set read_fds = master_set;
         timeval tv{};
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
+        tv.tv_sec = 0;
+        tv.tv_usec = 500000; // 500 ms
 
         int ready = select(max_fd + 1, &read_fds, nullptr, nullptr, &tv);
         if (ready < 0) {

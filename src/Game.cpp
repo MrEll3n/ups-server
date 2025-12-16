@@ -1,4 +1,5 @@
 #include "Game.hpp"
+#include "GameTypes.hpp"
 
 int Game::addPlayer(const std::string& username) {
     int id = nextUserId++;
@@ -54,6 +55,7 @@ void Game::leaveLobby(int userId) {
                 } else {
                     // Reset game state when someone leaves
                     lobby.inGame = false;
+                    lobby.matchJustEnded = false;
                     lobby.p1Move = MoveType::NONE;
                     lobby.p2Move = MoveType::NONE;
                     lobby.p1Wins = 0;
@@ -85,6 +87,7 @@ bool Game::canStartGame(Lobby* lobby) const {
 void Game::startGame(Lobby* lobby) {
     if (!lobby) return;
     lobby->inGame = true;
+    lobby->matchJustEnded = false;
     lobby->p1Move = MoveType::NONE;
     lobby->p2Move = MoveType::NONE;
     lobby->p1Wins = 0;
@@ -138,9 +141,22 @@ bool Game::submitMove(int userId, MoveType move,
     const int p1Id = lobby->players[0].userId;
     const int p2Id = lobby->players[1].userId;
 
-    if (userId == p1Id) lobby->p1Move = move;
-    else if (userId == p2Id) lobby->p2Move = move;
-    else return false;
+    // CRITICAL: Check if player already submitted a move this round
+    if (userId == p1Id) {
+        if (lobby->p1Move != MoveType::NONE) {
+            // Player 1 already submitted - reject
+            return false;
+        }
+        lobby->p1Move = move;
+    } else if (userId == p2Id) {
+        if (lobby->p2Move != MoveType::NONE) {
+            // Player 2 already submitted - reject
+            return false;
+        }
+        lobby->p2Move = move;
+    } else {
+        return false;
+    }
 
     // If both moves are in, resolve round
     if (lobby->p1Move != MoveType::NONE && lobby->p2Move != MoveType::NONE) {
@@ -171,6 +187,7 @@ bool Game::submitMove(int userId, MoveType move,
             outP1Wins = lobby->p1Wins;
             outP2Wins = lobby->p2Wins;
             lobby->inGame = false;
+            lobby->matchJustEnded = true; // PŘECHOD DO AFTER_GAME STAVU
         } else {
             outP1Wins = lobby->p1Wins;
             outP2Wins = lobby->p2Wins;
@@ -184,6 +201,7 @@ bool Game::requestRematch(int userId, Lobby* lobby) {
     if (!lobby) return false;
     if (lobby->players.size() != 2) return false;
     if (lobby->inGame) return false;
+    if (!lobby->matchJustEnded) return false; // Povoleno jen v AFTER_GAME
 
     const int p1Id = lobby->players[0].userId;
     const int p2Id = lobby->players[1].userId;
@@ -198,6 +216,7 @@ bool Game::requestRematch(int userId, Lobby* lobby) {
 bool Game::canStartRematch(Lobby* lobby) const {
     if (!lobby) return false;
     if (lobby->players.size() != 2) return false;
+    if (!lobby->matchJustEnded) return false; // Kontrola stavu AFTER_GAME
     return lobby->p1Rematch && lobby->p2Rematch;
 }
 
