@@ -69,6 +69,12 @@ namespace Responses {
     // Server heartbeat (client must reply with REQ_PONG|same_nonce|)
     std::string ping(const std::string& nonce);
 
+    // "RES_OPPONENT_DISCONNECTED|15"
+    std::string opponent_disconnected(int seconds);
+
+    // "RES_GAME_RESUMED"
+    std::string game_resumed();
+
     // ---- Error responses ----
     std::string error_unexpected_state();
     std::string error_invalid_magic();

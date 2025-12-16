@@ -41,7 +41,10 @@ private:
         std::chrono::steady_clock::time_point last_ping{std::chrono::steady_clock::now()};
         std::string last_nonce{};
     };
+
     std::unordered_map<int, Heartbeat> heartbeats;
+
+    std::unordered_map<int, std::chrono::steady_clock::time_point> disconnected_players;
 
     void init_socket(int port);
     void accept_client();
@@ -56,6 +59,10 @@ private:
     bool is_request_allowed(SessionPhase phase, RequestType type) const;
 
     void notify_lobby_peers_player_left(int playerId, const std::string& reason);
+
+    void check_disconnection_timeouts();
+
+    int find_disconnected_player_by_name(const std::string& name);
 
     // Unified cleanup path for unexpected disconnects / timeouts
     void disconnect_fd(int fd, const std::string& reason);

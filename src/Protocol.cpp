@@ -123,6 +123,13 @@ std::string ping(const std::string& nonce) {
     return prefix("RES_PING|" + nonce);
 }
 
+std::string opponent_disconnected(int seconds) {
+    return prefix("RES_OPPONENT_DISCONNECTED|" + std::to_string(seconds));
+}
+std::string game_resumed() {
+    return prefix("RES_GAME_RESUMED");
+}
+
 std::string error_unexpected_state() { return prefix("RES_ERROR|Unexpected request in current session state"); }
 std::string error_invalid_magic()     { return prefix("RES_ERROR|Invalid protocol magic"); }
 std::string error_invalid_move()      { return prefix("RES_ERROR|Invalid move"); }
