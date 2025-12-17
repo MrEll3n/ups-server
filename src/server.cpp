@@ -112,10 +112,13 @@ void Server::accept_client() {
 
     client_buffers[client_fd] = "";
 
+    // INICIALIZACE HEARTBEATU: Dej klientovi čistý štít
     Heartbeat hb;
     auto now = std::chrono::steady_clock::now();
-    hb.last_pong = now;  // Čas, kdy naposledy klient odpověděl
-    hb.last_ping = now;  // Čas, kdy jsme poslali poslední ping
+    hb.last_pong = now;  // Nastavíme na TEĎ, aby neprošel timeoutem
+    hb.last_ping = now;  // První ping pošleme za 2 sekundy
+    hb.last_nonce = "";
+
     heartbeats[client_fd] = hb;
     std::cerr << "[SYS] Client connected fd=" << client_fd << "\n";
 }
