@@ -112,13 +112,10 @@ void Server::accept_client() {
 
     client_buffers[client_fd] = "";
 
-    // OPRAVA TADY:
     Heartbeat hb;
     auto now = std::chrono::steady_clock::now();
-    hb.last_pong = now;  // Klient má teď 5 vteřin na první odezvu
-    hb.last_ping = now;  // První ping mu pošleme za 2 vteřiny
-    hb.last_nonce = "";
-
+    hb.last_pong = now;  // Čas, kdy naposledy klient odpověděl
+    hb.last_ping = now;  // Čas, kdy jsme poslali poslední ping
     heartbeats[client_fd] = hb;
     std::cerr << "[SYS] Client connected fd=" << client_fd << "\n";
 }
@@ -382,37 +379,43 @@ void Server::handle_request(int fd, const Request& req) {
             }
             const std::string username = req.params[0];
 
-            // 1. Kontrola, zda uživatel není náhodou už online na jiném socketu
+            // 1. Kontrola duplicit (zda už jméno někdo nepoužívá právě teď)
             bool nameTaken = false;
             for (const auto& kv : g_online_users) {
                 if (kv.second == username) { nameTaken = true; break; }
             }
+            if (nameTaken) {
+                send_line(fd, Responses::error("Name already in use"));
+                break;
+            }
 
-            // 2. Pokus o Reconnect (Hledání v odpojených)
+            // 2. Pokus o RECONNECT
             int oldUserId = find_disconnected_player_by_name(username);
             if (oldUserId != -1) {
                 std::cerr << "[SYS] User " << username << " reconnected (ID: " << oldUserId << ")\n";
 
                 fd_to_player[fd] = oldUserId;
                 disconnected_players.erase(oldUserId);
-                g_online_users[oldUserId] = username; // Znovu registrujeme jako aktivního
+                g_online_users[oldUserId] = username;
 
-                // Potvrzení přihlášení
+                // Reset heartbeatu pro nové spojení, aby hned nedostal timeout
+                if (heartbeats.find(fd) != heartbeats.end()) {
+                    auto now = std::chrono::steady_clock::now();
+                    heartbeats[fd].last_pong = now;
+                    heartbeats[fd].last_ping = now;
+                }
+
                 send_line(fd, Responses::login_ok(oldUserId));
 
-                // Obnova stavu v lobby/hře
                 auto lobbyOpt = game.getLobbyOf(oldUserId);
                 if (lobbyOpt.has_value()) {
                     Lobby* lobby = lobbyOpt.value();
-
-                    // Pošleme info o lobby, ve které byl
                     send_line(fd, Responses::lobby_joined(lobby->name));
 
                     if (lobby->inGame) {
-                        // Klíčové: Pošleme zprávu, že hra běží
                         send_line(fd, Responses::game_started());
 
-                        // Informujeme soupeře, že jsme zpět
+                        // Informujeme soupeře, že se hráč vrátil
                         for (auto& p : lobby->players) {
                             if (p.userId == oldUserId) continue;
                             for (auto& kv : fd_to_player) {
@@ -420,22 +423,25 @@ void Server::handle_request(int fd, const Request& req) {
                             }
                         }
 
-                        // Zde můžeš volitelně poslat aktuální skóre, aby se klientovi překreslilo UI
-                        // Použijeme k tomu zprávu state, kterou klient umí parsovat
-                        std::string syncInfo = "score=" + std::to_string(lobby->p1Wins) + ":" + std::to_string(lobby->p2Wins);
-                        send_line(fd, Responses::state(syncInfo));
+                        // --- SYNCHRONIZACE STAVU (Skóre + informujeme klienta, zda už vsadil) ---
+                        std::ostringstream oss;
+                        oss << "score=" << lobby->p1Wins << ":" << lobby->p2Wins << ";";
+
+                        // Zjistíme, zda tento konkrétní hráč už má v tomto kole vsazeno
+                        bool hasMoved = false;
+                        if (!lobby->players.empty()) {
+                            if (lobby->players[0].userId == oldUserId && lobby->p1Move != MoveType::NONE) hasMoved = true;
+                            else if (lobby->players.size() > 1 && lobby->players[1].userId == oldUserId && lobby->p2Move != MoveType::NONE) hasMoved = true;
+                        }
+                        oss << "hasMoved=" << (hasMoved ? "true" : "false") << ";";
+
+                        send_line(fd, Responses::state(oss.str()));
                     }
                 }
                 break;
             }
 
-            // 3. Klasický nový login (pokud jméno není obsazeno)
-            if (nameTaken) {
-                send_line(fd, Responses::error("Name already in use"));
-                break;
-            }
-
-            // 3. Nový hráč
+            // 3. Nový hráč (standardní přihlášení)
             if (fd_to_player.find(fd) != fd_to_player.end()) {
                 send_line(fd, Responses::error_unexpected_state());
                 break;
@@ -454,7 +460,6 @@ void Server::handle_request(int fd, const Request& req) {
                 try_free_lobby_name(game, userId);
                 game.leaveLobby(userId);
                 game.removePlayer(userId);
-                // NEVYMAZÁVAT fd_to_player ZDE! Nechat na disconnect_fd.
             }
             send_line(fd, Responses::logout_ok());
             disconnect_fd(fd, "LOGOUT");
@@ -533,13 +538,12 @@ void Server::handle_request(int fd, const Request& req) {
             }
 
             int rw = 0, mw = 0, p1w = 0, p2w = 0;
-            // !!! Fix: Inicializace na NONE !!!
             MoveType m1 = MoveType::NONE;
             MoveType m2 = MoveType::NONE;
             bool me = false;
 
             if (!game.submitMove(userId, mv, rw, m1, m2, me, mw, p1w, p2w)) {
-                send_line(fd, Responses::error_not_in_game());
+                send_line(fd, Responses::error("Move rejected (already moved or not your turn)"));
                 break;
             }
             send_line(fd, Responses::move_accepted(move_to_string(mv)));
@@ -547,6 +551,7 @@ void Server::handle_request(int fd, const Request& req) {
             auto lobbyOpt = game.getLobbyOf(userId);
             if (lobbyOpt.has_value()) {
                 Lobby* lobby = lobbyOpt.value();
+                // Pokud oba hráči táhli, pošleme výsledek kola všem
                 if (m1 != MoveType::NONE && m2 != MoveType::NONE) {
                     for (auto& p : lobby->players) {
                         for (auto& kv : fd_to_player) {
@@ -555,6 +560,7 @@ void Server::handle_request(int fd, const Request& req) {
                         }
                     }
                 }
+                // Pokud zápas skončil, pošleme výsledek zápasu
                 if (me) {
                     for (auto& p : lobby->players) {
                         for (auto& kv : fd_to_player) {
@@ -596,8 +602,16 @@ void Server::handle_request(int fd, const Request& req) {
             int userId = -1;
             auto it = fd_to_player.find(fd);
             if (it != fd_to_player.end()) userId = it->second;
+
             std::ostringstream oss;
             oss << "phase=" << phase_to_debug(ph) << ";";
+
+            // Přidáme aktuální skóre do STATE odpovědi
+            auto lobbyOpt = game.getLobbyOf(userId);
+            if (lobbyOpt.has_value()) {
+                oss << "score=" << lobbyOpt.value()->p1Wins << ":" << lobbyOpt.value()->p2Wins << ";";
+            }
+
             if (userId >= 0) oss << "playerId=" << userId << ";";
             send_line(fd, Responses::state(oss.str()));
             break;
@@ -605,7 +619,9 @@ void Server::handle_request(int fd, const Request& req) {
 
         case RequestType::PONG: {
             auto it = heartbeats.find(fd);
-            if (it != heartbeats.end()) it->second.last_pong = std::chrono::steady_clock::now();
+            if (it != heartbeats.end()) {
+                it->second.last_pong = std::chrono::steady_clock::now();
+            }
             break;
         }
 
