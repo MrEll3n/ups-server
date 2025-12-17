@@ -287,6 +287,9 @@ void Server::check_disconnection_timeouts() {
             game.leaveLobby(userId);
             game.removePlayer(userId);
 
+            // FIX: po vypršení reconnect okna už jméno nesmí zůstat rezervované
+            g_online_users.erase(userId);
+
             timed_out_users.push_back(userId);
         }
     }
