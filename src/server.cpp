@@ -112,16 +112,14 @@ void Server::accept_client() {
 
     client_buffers[client_fd] = "";
 
-    // OPRAVA: Inicializujeme last_pong na AKTUÁLNÍ čas,
-    // aby klient hned nedostal timeout dřív, než mu stihneme poslat první ping.
+    // OPRAVA TADY:
     Heartbeat hb;
     auto now = std::chrono::steady_clock::now();
-    hb.last_pong = now;
-    hb.last_ping = now; // První ping pošleme až za 2 sekundy
+    hb.last_pong = now;  // Klient má teď 5 vteřin na první odezvu
+    hb.last_ping = now;  // První ping mu pošleme za 2 vteřiny
     hb.last_nonce = "";
 
     heartbeats[client_fd] = hb;
-
     std::cerr << "[SYS] Client connected fd=" << client_fd << "\n";
 }
 
