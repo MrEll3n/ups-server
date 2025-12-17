@@ -218,44 +218,54 @@ void Server::notify_lobby_peers_player_left(int playerId, const std::string& rea
 }
 
 void Server::disconnect_fd(int fd, const std::string& reason) {
-    heartbeats.erase(fd);
-    client_buffers.erase(fd);
-
     auto it = fd_to_player.find(fd);
     if (it != fd_to_player.end()) {
         int userId = it->second;
         auto lobbyOpt = game.getLobbyOf(userId);
 
-        // Zjistíme, zda je ve hře
-        bool inActiveGame = lobbyOpt.has_value() && lobbyOpt.value()->inGame;
-
-        if (inActiveGame) {
-            // SOFT DISCONNECT: Hráč zůstává v g_online_users (aby mu nikdo nesebral jméno)
-            // a v objektu Game (aby zůstalo skóre).
-            std::cerr << "[SYS] User " << userId << " lost connection (Soft). Waiting 15s.\n";
+        // Zjistíme, zda je hráč v aktivní hře
+        if (lobbyOpt.has_value() && lobbyOpt.value()->inGame) {
+            // --- SOFT DISCONNECT ---
+            // Hráč vypadl ze hry, ale necháváme ho v g_online_users,
+            // aby mu nikdo nezabral jméno a mohl se vrátit.
             disconnected_players[userId] = std::chrono::steady_clock::now();
 
+            std::cerr << "[SYS] User " << userId << " lost connection (Soft). Reason: " << reason << ". Waiting 15s.\n";
+
+            // Informujeme soupeře v lobby
             Lobby* lobby = lobbyOpt.value();
             for (auto& p : lobby->players) {
                 if (p.userId == userId) continue;
                 for (auto& kv : fd_to_player) {
                     if (kv.second == p.userId) {
+                        // Posíláme info o odpojení a zbývající čas (15s)
                         send_line(kv.first, Responses::opponent_disconnected(15));
                     }
                 }
             }
         } else {
-            // HARD DISCONNECT: Hráč nebyl ve hře, můžeme ho smazat úplně.
-            std::cerr << "[SYS] User " << userId << " disconnected (Hard).\n";
-            g_online_users.erase(userId);
+            // --- HARD DISCONNECT ---
+            // Hráč nebyl ve hře, můžeme ho rovnou úplně odstranit.
+            std::cerr << "[SYS] User " << userId << " disconnected (Hard). Reason: " << reason << ".\n";
+
             try_free_lobby_name(game, userId);
+            game.leaveLobby(userId);
+
+            g_online_users.erase(userId);
             game.removePlayer(userId);
         }
+
+        // V obou případech musíme smazat vazbu na socket
         fd_to_player.erase(it);
+    } else {
+        std::cerr << "[SYS] Unknown client on fd=" << fd << " disconnected. Reason: " << reason << ".\n";
     }
 
+    // Úklid síťových struktur
     close(fd);
     FD_CLR(fd, &master_set);
+    client_buffers.erase(fd);
+    heartbeats.erase(fd);
 }
 
 void Server::check_disconnection_timeouts() {
@@ -382,26 +392,16 @@ void Server::handle_request(int fd, const Request& req) {
             }
             const std::string username = req.params[0];
 
-            // 1. Kontrola duplicit (zda už jméno někdo nepoužívá právě teď)
-            bool nameTaken = false;
-            for (const auto& kv : g_online_users) {
-                if (kv.second == username) { nameTaken = true; break; }
-            }
-            if (nameTaken) {
-                send_line(fd, Responses::error("Name already in use"));
-                break;
-            }
-
-            // 2. Pokus o RECONNECT
+            // 1. POKUS O RECONNECT (Musí být PRVNÍ!)
             int oldUserId = find_disconnected_player_by_name(username);
             if (oldUserId != -1) {
                 std::cerr << "[SYS] User " << username << " reconnected (ID: " << oldUserId << ")\n";
 
                 fd_to_player[fd] = oldUserId;
                 disconnected_players.erase(oldUserId);
-                g_online_users[oldUserId] = username;
+                // Jméno v g_online_users už je, jen ho tam ponecháme přiřazené k oldUserId
 
-                // Reset heartbeatu pro nové spojení, aby hned nedostal timeout
+                // Reset heartbeatu
                 if (heartbeats.find(fd) != heartbeats.end()) {
                     auto now = std::chrono::steady_clock::now();
                     heartbeats[fd].last_pong = now;
@@ -418,7 +418,7 @@ void Server::handle_request(int fd, const Request& req) {
                     if (lobby->inGame) {
                         send_line(fd, Responses::game_started());
 
-                        // Informujeme soupeře, že se hráč vrátil
+                        // Informujeme soupeře
                         for (auto& p : lobby->players) {
                             if (p.userId == oldUserId) continue;
                             for (auto& kv : fd_to_player) {
@@ -426,25 +426,32 @@ void Server::handle_request(int fd, const Request& req) {
                             }
                         }
 
-                        // --- SYNCHRONIZACE STAVU (Skóre + informujeme klienta, zda už vsadil) ---
+                        // Synchronizace stavu
                         std::ostringstream oss;
                         oss << "score=" << lobby->p1Wins << ":" << lobby->p2Wins << ";";
-
-                        // Zjistíme, zda tento konkrétní hráč už má v tomto kole vsazeno
                         bool hasMoved = false;
                         if (!lobby->players.empty()) {
                             if (lobby->players[0].userId == oldUserId && lobby->p1Move != MoveType::NONE) hasMoved = true;
                             else if (lobby->players.size() > 1 && lobby->players[1].userId == oldUserId && lobby->p2Move != MoveType::NONE) hasMoved = true;
                         }
                         oss << "hasMoved=" << (hasMoved ? "true" : "false") << ";";
-
                         send_line(fd, Responses::state(oss.str()));
                     }
                 }
                 break;
             }
 
-            // 3. Nový hráč (standardní přihlášení)
+            // 2. KONTROLA DUPLICIT (Jen pro nové hráče)
+            bool nameTaken = false;
+            for (const auto& kv : g_online_users) {
+                if (kv.second == username) { nameTaken = true; break; }
+            }
+            if (nameTaken) {
+                send_line(fd, Responses::error("Name already in use"));
+                break;
+            }
+
+            // 3. NOVÝ HRÁČ
             if (fd_to_player.find(fd) != fd_to_player.end()) {
                 send_line(fd, Responses::error_unexpected_state());
                 break;
