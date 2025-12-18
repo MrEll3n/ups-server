@@ -10,6 +10,7 @@
 #include <iostream>
 #include <sstream>
 #include <chrono>
+#include <optional>
 #include <random>
 #include <ctime>
 #include <map>
@@ -32,16 +33,25 @@ static std::string phase_to_debug(SessionPhase ph) {
 static std::map<int, std::string> g_online_users;
 static std::set<std::string> g_active_lobbies;
 
-// Funkce pro uvolnění jména lobby, pokud zaniká
-void try_free_lobby_name(Game& game, int userId) {
+// Snapshot of lobby membership (used to release lobby name deterministically).
+struct LobbySnapshot {
+    std::string name;
+    size_t size;
+};
+
+static std::optional<LobbySnapshot> snapshot_lobby_of(Game& game, int userId) {
     auto lobbyOpt = game.getLobbyOf(userId);
-    if (lobbyOpt.has_value()) {
-        Lobby* lobby = lobbyOpt.value();
-        // Pokud je hráč poslední v lobby (size <= 1), lobby zanikne -> uvolníme jméno
-        if (lobby->players.size() <= 1) {
-            g_active_lobbies.erase(lobby->name);
-            std::cerr << "[SYS] Lobby '" << lobby->name << "' is empty and destroyed. Name released.\n";
-        }
+    if (!lobbyOpt.has_value()) return std::nullopt;
+    Lobby* lobby = lobbyOpt.value();
+    if (!lobby) return std::nullopt;
+    return LobbySnapshot{lobby->name, lobby->players.size()};
+}
+
+static void release_lobby_name(const std::string& lobbyName) {
+    auto it = g_active_lobbies.find(lobbyName);
+    if (it != g_active_lobbies.end()) {
+        g_active_lobbies.erase(it);
+        std::cerr << "[SYS] Lobby '" << lobbyName << "' destroyed. Name released.\n";
     }
 }
 
@@ -215,7 +225,6 @@ void Server::notify_lobby_peers_player_left(int playerId, const std::string& rea
         }
 
         // Úklid lobby na straně serveru
-        try_free_lobby_name(game, peerId);
         game.leaveLobby(peerId);
     }
 }
@@ -224,6 +233,7 @@ void Server::disconnect_fd(int fd, const std::string& reason) {
     auto it = fd_to_player.find(fd);
     if (it != fd_to_player.end()) {
         int userId = it->second;
+        auto lobbySnap = snapshot_lobby_of(game, userId);
         auto lobbyOpt = game.getLobbyOf(userId);
         SessionPhase phase = get_phase(fd); // Využívá tvou matchJustEnded logiku
 
@@ -251,8 +261,12 @@ void Server::disconnect_fd(int fd, const std::string& reason) {
             std::cerr << "[SYS] User " << userId << " lost connection in AFTER_GAME (Soft). Waiting 15s.\n";
 
             // Vyčistíme jeho lobby stav na serveru (aby po reconnectu lobby už neexistovala).
-            try_free_lobby_name(game, userId);
             game.leaveLobby(userId);
+
+            // Po AFTER_GAME disconnectu lobby vždy končí -> uvolnit jméno deterministicky.
+            if (lobbySnap.has_value()) {
+                release_lobby_name(lobbySnap->name);
+            }
         } else {
             // --- HARD DISCONNECT (AfterMatch nebo Lobby) ---
             // Pokud jsou v AfterMatch, vykopneme soupeře hned
@@ -261,9 +275,16 @@ void Server::disconnect_fd(int fd, const std::string& reason) {
             }
 
             std::cerr << "[SYS] User " << userId << " hard disconnected. Reason: " << reason << ".\n";
-
-            try_free_lobby_name(game, userId);
             game.leaveLobby(userId);
+
+            // Pokud hráč odpadl v lobby/after-game, lobby se na serveru fakticky ukončuje.
+            if (lobbySnap.has_value() && (phase == SessionPhase::AFTER_GAME || phase == SessionPhase::InLobby)) {
+                release_lobby_name(lobbySnap->name);
+            } else if (lobbySnap.has_value() && lobbySnap->size <= 1) {
+                // Případ: byl v lobby sám
+                release_lobby_name(lobbySnap->name);
+            }
+
             g_online_users.erase(userId);
             game.removePlayer(userId);
         }
@@ -288,12 +309,18 @@ void Server::check_disconnection_timeouts() {
         if (duration_cast<seconds>(now - disconnect_time).count() > 15) {
             std::cerr << "[SYS] Reconnect timeout for user " << userId << ". Ending match.\n";
 
+            auto lobbySnap = snapshot_lobby_of(game, userId);
+
             notify_lobby_peers_player_left(userId, "Opponent timed out");
-            try_free_lobby_name(game, userId);
 
             // Pojistka: vyhodit z lobby a odstranit hráče
             game.leaveLobby(userId);
             game.removePlayer(userId);
+
+            // Po timeoutu lobby musí zaniknout -> uvolnit jméno
+            if (lobbySnap.has_value()) {
+                release_lobby_name(lobbySnap->name);
+            }
 
             // FIX: po vypršení reconnect okna už jméno nesmí zůstat rezervované
             g_online_users.erase(userId);
@@ -509,8 +536,12 @@ void Server::handle_request(int fd, const Request& req) {
             auto it = fd_to_player.find(fd);
             if (it != fd_to_player.end()) {
                 int userId = it->second;
-                try_free_lobby_name(game, userId);
+                auto snap = snapshot_lobby_of(game, userId);
                 game.leaveLobby(userId);
+                // Release name only if this player was the last one.
+                if (snap.has_value() && snap->size <= 1) {
+                    release_lobby_name(snap->name);
+                }
                 game.removePlayer(userId);
             }
             send_line(fd, Responses::logout_ok());
@@ -570,9 +601,13 @@ void Server::handle_request(int fd, const Request& req) {
 
         case RequestType::LEAVE_LOBBY: {
             int userId = fd_to_player[fd];
+            auto snap = snapshot_lobby_of(game, userId);
             notify_lobby_peers_player_left(userId, "Opponent left the lobby");
-            try_free_lobby_name(game, userId);
             game.leaveLobby(userId);
+            // If a player leaves a lobby, the lobby may be destroyed (size==1 before leave).
+            if (snap.has_value() && snap->size <= 1) {
+                release_lobby_name(snap->name);
+            }
             send_line(fd, Responses::lobby_left());
             break;
         }
