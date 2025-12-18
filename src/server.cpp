@@ -197,6 +197,7 @@ void Server::notify_lobby_peers_player_left(int playerId, const std::string& rea
     Lobby* lobby = lobbyOpt.value();
     if (!lobby) return;
 
+    // Musíme si seznam peerů uložit předem, protože game.leaveLobby mění lobby->players
     std::vector<int> peerIds;
     for (auto& p : lobby->players) {
         if (p.userId == playerId) continue;
@@ -206,12 +207,14 @@ void Server::notify_lobby_peers_player_left(int playerId, const std::string& rea
     for (int peerId : peerIds) {
         for (auto& kv : fd_to_player) {
             if (kv.second == peerId) {
+                // 1. Přepne scénu klienta na LobbyScene (díky on_message v AfterMatchScene)
                 send_line(kv.first, Responses::game_cannot_continue(reason));
+                // 2. Vynuluje in_lobby příznak v AppState klienta
                 send_line(kv.first, Responses::lobby_left());
             }
         }
 
-        // Zkusit uvolnit jméno lobby, pokud peer byl poslední
+        // Úklid lobby na straně serveru
         try_free_lobby_name(game, peerId);
         game.leaveLobby(peerId);
     }
@@ -222,27 +225,42 @@ void Server::disconnect_fd(int fd, const std::string& reason) {
     if (it != fd_to_player.end()) {
         int userId = it->second;
         auto lobbyOpt = game.getLobbyOf(userId);
-        SessionPhase phase = get_phase(fd); // Používá tvou matchJustEnded logiku
+        SessionPhase phase = get_phase(fd); // Využívá tvou matchJustEnded logiku
 
         if (lobbyOpt.has_value() && phase == SessionPhase::InGame) {
-            // RECONNECT LOGIKA: Tady NESMÍME volat notify_lobby...
+            // --- RECONNECT LOGIKA (Nedotčeno) ---
             disconnected_players[userId] = std::chrono::steady_clock::now();
+            std::cerr << "[SYS] User " << userId << " lost connection (Soft). Waiting 15s.\n";
 
             Lobby* lobby = lobbyOpt.value();
             for (auto& p : lobby->players) {
                 if (p.userId == userId) continue;
                 for (auto& kv : fd_to_player) {
                     if (kv.second == p.userId) {
-                        // Posíláme JEN informaci o odpojení, nevyhazujeme soupeře z lobby
                         send_line(kv.first, Responses::opponent_disconnected(15));
                     }
                 }
             }
+        } else if (lobbyOpt.has_value() && phase == SessionPhase::AFTER_GAME) {
+            // --- AFTER MATCH: soft disconnect + okamžitě ukončit lobby pro soupeře ---
+            // Soupeř (pokud je online) musí okamžitě zpět do Lobby/Browsing.
+            notify_lobby_peers_player_left(userId, "Opponent left after match");
+
+            // Odpojeného hráče ponecháme na 15s pro reconnect (aby se po návratu dal "syncnout").
+            disconnected_players[userId] = std::chrono::steady_clock::now();
+            std::cerr << "[SYS] User " << userId << " lost connection in AFTER_GAME (Soft). Waiting 15s.\n";
+
+            // Vyčistíme jeho lobby stav na serveru (aby po reconnectu lobby už neexistovala).
+            try_free_lobby_name(game, userId);
+            game.leaveLobby(userId);
         } else {
-            // HARD DISCONNECT (Lobby nebo AfterMatch): Tady soupeře vyhodit CHCEME
+            // --- HARD DISCONNECT (AfterMatch nebo Lobby) ---
+            // Pokud jsou v AfterMatch, vykopneme soupeře hned
             if (phase == SessionPhase::AFTER_GAME || phase == SessionPhase::InLobby) {
                 notify_lobby_peers_player_left(userId, "Opponent left the session");
             }
+
+            std::cerr << "[SYS] User " << userId << " hard disconnected. Reason: " << reason << ".\n";
 
             try_free_lobby_name(game, userId);
             game.leaveLobby(userId);
@@ -251,7 +269,7 @@ void Server::disconnect_fd(int fd, const std::string& reason) {
         }
         fd_to_player.erase(it);
     }
-    // Úklid socketu a heartbeatů...
+
     close(fd);
     FD_CLR(fd, &master_set);
     client_buffers.erase(fd);
@@ -419,17 +437,42 @@ void Server::handle_request(int fd, const Request& req) {
                         // Synchronizace stavu
                         std::ostringstream oss;
                         oss << "score=" << lobby->p1Wins << ":" << lobby->p2Wins << ";";
-                        bool hasMoved = false;
-                        if (!lobby->players.empty()) {
-                            if (lobby->players[0].userId == oldUserId && lobby->p1Move != MoveType::NONE) hasMoved = true;
-                            else if (lobby->players.size() > 1 && lobby->players[1].userId == oldUserId && lobby->p2Move != MoveType::NONE) hasMoved = true;
+
+                        // Basic identity (helps the client show names instead of P1/P2)
+                        if (lobby->players.size() >= 1) {
+                            oss << "p1Id=" << lobby->players[0].userId << ";";
+                            oss << "p1Name=" << lobby->players[0].username << ";";
                         }
+                        if (lobby->players.size() >= 2) {
+                            oss << "p2Id=" << lobby->players[1].userId << ";";
+                            oss << "p2Name=" << lobby->players[1].username << ";";
+                        }
+
+                        bool hasMoved = false;
+                        MoveType myMove = MoveType::NONE;
+
+                        if (!lobby->players.empty()) {
+                            if (lobby->players[0].userId == oldUserId) {
+                                myMove = lobby->p1Move;
+                                hasMoved = (lobby->p1Move != MoveType::NONE);
+                            } else if (lobby->players.size() > 1 && lobby->players[1].userId == oldUserId) {
+                                myMove = lobby->p2Move;
+                                hasMoved = (lobby->p2Move != MoveType::NONE);
+                            }
+                        }
+
                         oss << "hasMoved=" << (hasMoved ? "true" : "false") << ";";
+                        if (hasMoved) {
+                            const std::string mv = move_to_string(myMove);
+                            // If we ever see an empty mv here, keep it visible in logs.
+                            oss << "lastMove=" << (mv.empty() ? "?" : mv) << ";";
+                        }
+
                         send_line(fd, Responses::state(oss.str()));
                     }
                 } else {
-                    // OPRAVA: Uživatel se vrátil, ale lobby už neexistuje (např. odpojení po hře)
-                    // Musíme poslat RES_LOBBY_LEFT, aby si klient vynuloval stav in_lobby
+                    // Uživatel se vrátil, ale lobby už neexistuje
+                    send_line(fd, Responses::game_cannot_continue("Match closed"));
                     send_line(fd, Responses::lobby_left());
                 }
                 break;
@@ -560,8 +603,6 @@ void Server::handle_request(int fd, const Request& req) {
             auto lobbyOpt = game.getLobbyOf(userId);
             if (lobbyOpt.has_value()) {
                 Lobby* lobby = lobbyOpt.value();
-                // Pokud oba hráči táhli, pošleme výsledek kola všem
-
 
                 std::cerr << "[DBG] submitMove: m1=" << (int)m1 << " m2=" << (int)m2
                           << " rw=" << rw << " score=" << lobby->p1Wins << ":" << lobby->p2Wins << "\n";
@@ -570,7 +611,6 @@ void Server::handle_request(int fd, const Request& req) {
                     for (auto& p : lobby->players) {
                         for (auto& kv : fd_to_player) {
                             if (kv.second == p.userId) {
-
                                 std::cerr << "[DBG] sending ROUND to fd=" << kv.first
                                           << " msg=" << Responses::round_result(
                                                 rw, move_to_string(m1), move_to_string(m2),
@@ -584,7 +624,6 @@ void Server::handle_request(int fd, const Request& req) {
                         }
                     }
                 }
-                // Pokud zápas skončil, pošleme výsledek zápasu
                 if (me) {
                     for (auto& p : lobby->players) {
                         for (auto& kv : fd_to_player) {
@@ -630,10 +669,38 @@ void Server::handle_request(int fd, const Request& req) {
             std::ostringstream oss;
             oss << "phase=" << phase_to_debug(ph) << ";";
 
-            // Přidáme aktuální skóre do STATE odpovědi
             auto lobbyOpt = game.getLobbyOf(userId);
             if (lobbyOpt.has_value()) {
-                oss << "score=" << lobbyOpt.value()->p1Wins << ":" << lobbyOpt.value()->p2Wins << ";";
+                Lobby* lobby = lobbyOpt.value();
+                oss << "score=" << lobby->p1Wins << ":" << lobby->p2Wins << ";";
+
+                if (lobby->players.size() >= 1) {
+                    oss << "p1Id=" << lobby->players[0].userId << ";";
+                    oss << "p1Name=" << lobby->players[0].username << ";";
+                }
+                if (lobby->players.size() >= 2) {
+                    oss << "p2Id=" << lobby->players[1].userId << ";";
+                    oss << "p2Name=" << lobby->players[1].username << ";";
+                }
+
+                if (lobby->inGame) {
+                    bool hasMoved = false;
+                    MoveType myMove = MoveType::NONE;
+
+                    if (!lobby->players.empty() && lobby->players[0].userId == userId) {
+                        myMove = lobby->p1Move;
+                        hasMoved = (lobby->p1Move != MoveType::NONE);
+                    } else if (lobby->players.size() > 1 && lobby->players[1].userId == userId) {
+                        myMove = lobby->p2Move;
+                        hasMoved = (lobby->p2Move != MoveType::NONE);
+                    }
+
+                    oss << "hasMoved=" << (hasMoved ? "true" : "false") << ";";
+                    if (hasMoved) {
+                        const std::string mv = move_to_string(myMove);
+                        oss << "lastMove=" << (mv.empty() ? "?" : mv) << ";";
+                    }
+                }
             }
 
             if (userId >= 0) oss << "playerId=" << userId << ";";
