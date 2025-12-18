@@ -565,11 +565,26 @@ void Server::handle_request(int fd, const Request& req) {
             if (lobbyOpt.has_value()) {
                 Lobby* lobby = lobbyOpt.value();
                 // Pokud oba hráči táhli, pošleme výsledek kola všem
+
+
+                std::cerr << "[DBG] submitMove: m1=" << (int)m1 << " m2=" << (int)m2
+                          << " rw=" << rw << " score=" << lobby->p1Wins << ":" << lobby->p2Wins << "\n";
+
                 if (m1 != MoveType::NONE && m2 != MoveType::NONE) {
                     for (auto& p : lobby->players) {
                         for (auto& kv : fd_to_player) {
-                            if (kv.second == p.userId)
-                                send_line(kv.first, Responses::round_result(rw, move_to_string(m1), move_to_string(m2)));
+                            if (kv.second == p.userId) {
+
+                                std::cerr << "[DBG] sending ROUND to fd=" << kv.first
+                                          << " msg=" << Responses::round_result(
+                                                rw, move_to_string(m1), move_to_string(m2),
+                                                lobby->p1Wins, lobby->p2Wins
+                                             )
+                                          << "\n";
+                                send_line(kv.first,
+                                    Responses::round_result(rw, move_to_string(m1), move_to_string(m2), lobby->p1Wins, lobby->p2Wins)
+                                );
+                            }
                         }
                     }
                 }

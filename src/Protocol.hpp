@@ -54,7 +54,9 @@ namespace Responses {
 
     std::string round_result(int winnerUserId,
                              const std::string& p1Move,
-                             const std::string& p2Move);
+                             const std::string& p2Move,
+                             int p1Wins,
+                             int p2Wins);
 
     std::string match_result(int winnerUserId,
                              int p1Wins,
