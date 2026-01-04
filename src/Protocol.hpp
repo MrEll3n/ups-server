@@ -14,7 +14,6 @@ enum class RequestType {
     MOVE,
     REMATCH,
     STATE,
-    // Heartbeat initiated by server: server sends RES_PING|nonce|, client answers REQ_PONG|nonce|
     PONG,
     INVALID
 };
@@ -24,8 +23,8 @@ enum class SessionPhase {
     LoggedInNoLobby,
     InLobby,
     InGame,
-    AFTER_GAME,   // PŘIDANÝ STAV
-    INVALID       // Ponecháme zde pro obsluhu v switch blocích
+    AFTER_GAME,
+    INVALID
 };
 
 struct Request {
@@ -68,13 +67,10 @@ namespace Responses {
 
     std::string state(const std::string& debug);
 
-    // Server heartbeat (client must reply with REQ_PONG|same_nonce|)
     std::string ping(const std::string& nonce);
 
-    // "RES_OPPONENT_DISCONNECTED|15"
     std::string opponent_disconnected(int seconds);
 
-    // "RES_GAME_RESUMED"
     std::string game_resumed();
 
     // ---- Error responses ----
@@ -88,6 +84,6 @@ namespace Responses {
     std::string error_not_in_game();
     std::string error_rematch_not_allowed();
     std::string error_malformed_request();
-    std::string error(const std::string& msg); // generic
+    std::string error(const std::string& msg);
 
 }

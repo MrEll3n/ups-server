@@ -41,7 +41,6 @@ private:
     std::mt19937 rng{std::random_device{}()};
     std::uniform_int_distribution<int> nonce_dist{100000, 999999};
 
-    // --- Soft disconnect / reconnect ---
     std::unordered_map<int, std::chrono::steady_clock::time_point> disconnected_players; // userId -> disconnect time
 
     void init_socket(const std::string& host, int port);
@@ -63,7 +62,7 @@ private:
 
     int find_disconnected_player_by_name(const std::string& name);
 
-    void disconnect_fd(int fd, const std::string& reason);
+    void disconnect_fd(int fd, const std::string& reason, bool allow_soft_disconnect = true);
 
     void heartbeat_tick();
 };

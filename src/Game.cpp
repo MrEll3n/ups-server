@@ -122,13 +122,11 @@ bool Game::submitMove(int userId, MoveType move,
                       int& outP1Wins,
                       int& outP2Wins) {
 
-    // --- FIX: Inicializace výstupů na NONE/0 ---
     outRoundWinnerUserId = 0;
     outMatchEnded = false;
     outMatchWinnerUserId = 0;
     outP1Move = MoveType::NONE;
     outP2Move = MoveType::NONE;
-    // -------------------------------------------
 
     auto lobbyOpt = getLobbyOf(userId);
     if (!lobbyOpt.has_value()) return false;
@@ -164,7 +162,6 @@ bool Game::submitMove(int userId, MoveType move,
         outP1Move = lobby->p1Move;
         outP2Move = lobby->p2Move;
 
-        // Reset tahů pro další kolo
         lobby->p1Move = MoveType::NONE;
         lobby->p2Move = MoveType::NONE;
 

@@ -17,7 +17,7 @@ struct Lobby {
     std::vector<Player> players; // size 0..2
 
     bool inGame{false};
-    bool matchJustEnded{false}; // Indikuje, že zápas právě skončil
+    bool matchJustEnded{false};
 
     MoveType p1Move{MoveType::NONE};
     MoveType p2Move{MoveType::NONE};

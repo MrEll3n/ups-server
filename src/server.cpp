@@ -16,7 +16,6 @@
 #include <map>
 #include <set>
 
-// Pomocná funkce pro ladění stavů
 static std::string phase_to_debug(SessionPhase ph) {
     switch (ph) {
         case SessionPhase::NotLoggedIn:      return "NotLoggedIn";
@@ -29,11 +28,9 @@ static std::string phase_to_debug(SessionPhase ph) {
     return "Unknown";
 }
 
-// Globální registry pro unikátnost jmen
 static std::map<int, std::string> g_online_users;
 static std::set<std::string> g_active_lobbies;
 
-// Snapshot of lobby membership (used to release lobby name deterministically).
 struct LobbySnapshot {
     std::string name;
     size_t size;
@@ -55,7 +52,6 @@ static void release_lobby_name(const std::string& lobbyName) {
     }
 }
 
-// Konstruktor
 Server::Server(const std::string& host, int port, bool enable_heartbeat, bool hb_logs)
     : heartbeat_enabled(enable_heartbeat), heartbeat_logs(hb_logs) {
 
@@ -73,7 +69,6 @@ Server::Server(const std::string& host, int port, bool enable_heartbeat, bool hb
     }
 }
 
-// Inicializace socketu s IP a Portem
 void Server::init_socket(const std::string& host, int port) {
     listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
@@ -244,7 +239,6 @@ void Server::disconnect_fd(int fd, const std::string& reason) {
                 }
             }
         } else if (lobbyOpt.has_value() && phase == SessionPhase::AFTER_GAME) {
-            // IMPLEMENTOVANÝ FIX: Hard disconnect pro AFTER_GAME
             notify_lobby_peers_player_left(userId, "Opponent left after match");
 
             std::cerr << "[SYS] User " << userId << " disconnected in AFTER_GAME. Cleaning up immediately.\n";
@@ -254,7 +248,6 @@ void Server::disconnect_fd(int fd, const std::string& reason) {
                 release_lobby_name(lobbySnap->name);
             }
 
-            // Kompletní smazání uživatele, aby se mohl hned znovu přihlásit
             g_online_users.erase(userId);
             game.removePlayer(userId);
         } else {
@@ -471,7 +464,6 @@ void Server::handle_request(int fd, const Request& req) {
                         send_line(fd, Responses::state(oss.str()));
                     }
                 } else {
-                    // IMPLEMENTOVANÝ FIX: Reconnect když lobby už neexistuje
                     std::cerr << "[SYS] User " << username << " reconnected but lobby is gone. Redirecting to menu.\n";
                     send_line(fd, Responses::lobby_left());
                 }
